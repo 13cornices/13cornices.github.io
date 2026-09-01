@@ -1,4 +1,4 @@
-const CACHE_NAME = "soccer-sub-tracker-v4";
+const CACHE_NAME = "soccer-sub-tracker-v6";
 
 const APP_FILES = [
   "./",

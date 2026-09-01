@@ -144,6 +144,7 @@ function persistTeams(teams) {
 const STATS_KEY    = "soccer_player_stats_v1";
 const ROSTERS_KEY  = "soccer_rosters_v1";
 const GAMES_KEY    = "soccer_games_v1";
+const SETTINGS_KEY = "soccer_display_settings_v1";
 
 // Roster: { id, name, isDefault, teamSize, players:[{id,name,num,lastName}] }
 function loadRosters() { try { return JSON.parse(localStorage.getItem(ROSTERS_KEY)||"[]"); } catch { return []; } }
@@ -153,6 +154,19 @@ function persistRosters(r) { try { localStorage.setItem(ROSTERS_KEY, JSON.string
 //           players:[{...playerWithStats}], teamSize } }
 function loadGames() { try { return JSON.parse(localStorage.getItem(GAMES_KEY)||"{}"); } catch { return {}; } }
 function persistGames(g) { try { localStorage.setItem(GAMES_KEY, JSON.stringify(g)); } catch {} }
+
+function loadSettings() {
+  try { return JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}"); } catch { return {}; }
+}
+function persistSettings(settings) {
+  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch {}
+}
+function boolSetting(settings, key, fallback) {
+  return typeof settings[key] === "boolean" ? settings[key] : fallback;
+}
+function nameModeSetting(settings) {
+  return ["first","firstInitial","full"].includes(settings.fieldNameMode) ? settings.fieldNameMode : "full";
+}
 
 const GAME_SETUPS_KEY = "soccer_game_setups_v1";
 // Game setup (template): { id, name, teamName, teamSize, roster, h1Formation, h2Formation, opponent, competition, savedAt }
@@ -284,8 +298,36 @@ function detectRosterColumns(rows) {
   return { numIdx, nameIdx, teamIdx, dataRows };
 }
 
+function getNameParts(player) {
+  const raw = (player?.name || "").trim();
+  const storedLast = (player?.lastName || "").trim();
+  const parts = raw.split(/\s+/).filter(Boolean);
+  const first = parts[0] || raw || "Player";
+  const inferredLast = parts.length > 1 ? parts[parts.length - 1] : "";
+  const last = storedLast || inferredLast;
+  const full = storedLast && !raw.toLowerCase().endsWith(storedLast.toLowerCase())
+    ? (raw + " " + storedLast).trim()
+    : raw;
+  return { first, last, full: full || first };
+}
+
+function fieldDisplayName(player, mode) {
+  const { first, last, full } = getNameParts(player);
+  if (mode === "first") return first;
+  if (mode === "firstInitial") return last ? `${first} ${last.charAt(0).toUpperCase()}.` : first;
+  return full;
+}
+
+function truncateLabel(label, maxLen) {
+  const clean = String(label || "").trim();
+  return clean.length > maxLen ? clean.slice(0, Math.max(1, maxLen - 1)) + "…" : clean;
+}
+
 // ── Main App ──────────────────────────────────────────────────────────────────
 function App() {
+  const initialSettingsRef = useRef(null);
+  if (!initialSettingsRef.current) initialSettingsRef.current = loadSettings();
+  const initialSettings = initialSettingsRef.current;
   const [screen, setScreen]       = useState("setup");
   const [teamSize, setTeamSize]   = useState(9);
   const [teamName, setTeamName]   = useState("My Team");
@@ -307,11 +349,12 @@ function App() {
   const [lastLoadedSetupName, setLastLoadedSetupName] = useState("");
   const [dataModal, setDataModal] = useState(false);
   const [settingsModal, setSettingsModal] = useState(false);
-  const [showJerseyNum, setShowJerseyNum] = useState(true);
-  const [showPlayerTeam, setShowPlayerTeam] = useState(true);
-  const [showHalfCols, setShowHalfCols]     = useState(true);
-  const [snapToGrid, setSnapToGrid]         = useState(true);
-  const [showGrid, setShowGrid]             = useState(true);
+  const [showJerseyNum, setShowJerseyNum] = useState(() => boolSetting(initialSettings, "showJerseyNum", true));
+  const [showPlayerTeam, setShowPlayerTeam] = useState(() => boolSetting(initialSettings, "showPlayerTeam", true));
+  const [fieldNameMode, setFieldNameMode] = useState(() => nameModeSetting(initialSettings));
+  const [showHalfCols, setShowHalfCols]     = useState(() => boolSetting(initialSettings, "showHalfCols", true));
+  const [snapToGrid, setSnapToGrid]         = useState(() => boolSetting(initialSettings, "snapToGrid", true));
+  const [showGrid, setShowGrid]             = useState(() => boolSetting(initialSettings, "showGrid", true));
   const [subPlanMode, setSubPlanMode]       = useState(true); // reserved for future
   const [tableSortCol, setTableSortCol]     = useState("shift");
   const [tableSortDir, setTableSortDir]     = useState("asc"); // "asc"|"desc"
@@ -330,6 +373,10 @@ function App() {
   const [h2Formation, setH2Formation] = useState(null);
   // Which formation screen is open in setup: null | "h1" | "h2"
   const [formationScreen, setFormationScreen] = useState(null);
+
+  useEffect(() => {
+    persistSettings({ showJerseyNum, showPlayerTeam, fieldNameMode, showHalfCols, snapToGrid, showGrid });
+  }, [showJerseyNum, showPlayerTeam, fieldNameMode, showHalfCols, snapToGrid, showGrid]);
 
   // Game
   // fieldPlayers: array indexed by slot (0..teamSize-1)
@@ -1477,6 +1524,7 @@ function App() {
       settingsModal={settingsModal} setSettingsModal={setSettingsModal}
       showJerseyNum={showJerseyNum} setShowJerseyNum={setShowJerseyNum}
       showPlayerTeam={showPlayerTeam} setShowPlayerTeam={setShowPlayerTeam}
+      fieldNameMode={fieldNameMode} setFieldNameMode={setFieldNameMode}
       showHalfCols={showHalfCols} setShowHalfCols={setShowHalfCols}
       statsModal={statsModal} setStatsModal={setStatsModal}
       playerStats={playerStats} setPlayerStats={setPlayerStats}
@@ -1498,6 +1546,7 @@ function App() {
         setField={setField} setBench={setBench} setPos={setPos}
         teamName={teamName} teamSize={teamSize}
         showJerseyNum={showJerseyNum}
+        fieldNameMode={fieldNameMode}
         snapToGrid={snapToGrid} showGrid={showGrid}
         lineConfig={lineConfig} setLineConfig={setLineConfig}
         which={which}
@@ -1656,7 +1705,7 @@ function App() {
                 </>}
                 {/* Name below circle — with optional jersey # */}
                 <text x={p.x} y={p.y+44} textAnchor="middle" fontSize="11" fill="#e2e8f0" fontWeight="500">
-                  {(()=>{const nm=player.name.length>11?player.name.slice(0,10)+"…":player.name; return showJerseyNum&&player.num?nm+" #"+player.num:nm;})()}
+                  {(()=>{const nm=truncateLabel(fieldDisplayName(player, fieldNameMode), 11); return showJerseyNum&&player.num?nm+" #"+player.num:nm;})()}
                 </text>
               </g>
             );
@@ -1860,7 +1909,7 @@ function App() {
         const d = dragRef2.current;
         const player = shownField[d.slot];
         if (!player) return null;
-        const nm = player.name.length>8?player.name.slice(0,7)+"…":player.name;
+        const nm = truncateLabel(fieldDisplayName(player, fieldNameMode), 8);
         const cx = d.clientX, cy = d.clientY;
         return (
           <div style={{position:"fixed",left:cx-32,top:cy-36,width:64,height:64,pointerEvents:"none",zIndex:9999}}>
@@ -1895,7 +1944,7 @@ function App() {
       {/* Player action */}
       {modal==="player" && selP && (
         <div style={S.overlay} onClick={safeClick(()=>{setModal(null);setSelSlot(null);})}>
-          <div style={S.card} onClick={e=>e.stopPropagation()}>
+          <div style={{...S.card,maxHeight:"85vh",overflowY:"auto",WebkitOverflowScrolling:"touch"}} onClick={e=>e.stopPropagation()}>
             <div style={{fontWeight:800,fontSize:17,color:"#fff"}}>{selP.num?`#${selP.num} `:""}{selP.name}</div>
             <div style={{fontSize:11,color:"#7aa0cc",marginBottom:14}}>
               Total: {fmtS(selP.totalMs)} · Shift: {fmtS(selP.shiftMs)}
@@ -2119,6 +2168,7 @@ function Setup({
   opponent, setOpponent, gameDate, setGameDate, competition, setCompetition,
   settingsModal, setSettingsModal, showJerseyNum, setShowJerseyNum,
   showPlayerTeam, setShowPlayerTeam,
+  fieldNameMode, setFieldNameMode,
   showHalfCols, setShowHalfCols,
   snapToGrid, setSnapToGrid, showGrid, setShowGrid,
   subPlanMode, setSubPlanMode,
@@ -2587,8 +2637,24 @@ function Setup({
       {/* ── SETTINGS MODAL ── */}
       {settingsModal && (
         <div style={S.overlay} onClick={()=>setSettingsModal(false)}>
-          <div style={S.card} onClick={e=>e.stopPropagation()}>
+          <div style={{...S.card,maxHeight:"85vh",overflowY:"auto",WebkitOverflowScrolling:"touch"}} onClick={e=>e.stopPropagation()}>
             <div style={{fontWeight:700,fontSize:15,marginBottom:14,color:"#fff"}}>⚙ Settings</div>
+            <div style={{background:"#071120",borderRadius:10,padding:"12px 14px",marginBottom:8}}>
+              <div style={{fontSize:14,color:"#e2e8f0",fontWeight:600}}>Field Name Display</div>
+              <div style={{fontSize:11,color:"#4a6a8a",marginTop:2,marginBottom:9}}>How player names appear on field circles</div>
+              <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:6}}>
+                {[
+                  ["first","First"],
+                  ["firstInitial","First L."],
+                  ["full","Full"],
+                ].map(([mode,label])=>(
+                  <button key={mode} onClick={()=>setFieldNameMode(mode)}
+                    style={{padding:"7px 4px",borderRadius:8,border:fieldNameMode===mode?"2px solid #60a5fa":"1px solid #1e3a5f",background:fieldNameMode===mode?"#1d4ed8":"#0d1f3c",color:fieldNameMode===mode?"#fff":"#7aa0cc",fontSize:11,fontWeight:700,cursor:"pointer"}}>
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </div>
             {[
               {label:"Show Jersey Numbers",sub:"Display #number after player name",val:showJerseyNum,set:setShowJerseyNum},
               {label:"Show Team Colors",sub:"Color roster rows by imported team label",val:showPlayerTeam,set:setShowPlayerTeam},
@@ -2694,7 +2760,7 @@ function Setup({
 // ── Formation Planner Screen ──────────────────────────────────────────────────
 // Shared field editor used for both h1 and h2 formation planning.
 // Uses the same SVG drag logic as the game screen.
-function FormationPlanner({ which, field, bench, pos, goals, setField, setBench, setPos, teamName, teamSize, showJerseyNum, snapToGrid, showGrid, lineConfig, setLineConfig, onSave, onLaunch, onOther, onMenu, otherLabel, isH2 }) {
+function FormationPlanner({ which, field, bench, pos, goals, setField, setBench, setPos, teamName, teamSize, showJerseyNum, fieldNameMode, snapToGrid, showGrid, lineConfig, setLineConfig, onSave, onLaunch, onOther, onMenu, otherLabel, isH2 }) {
   const svgRef2       = useRef(null);
   const dragRef       = useRef(null);   // field circle drag
   const benchDragRef2 = useRef(null);   // bench→field drag
@@ -3037,7 +3103,7 @@ function FormationPlanner({ which, field, bench, pos, goals, setField, setBench,
             const p = pos[slot] || {x:50,y:50};
             const isSel = selSlot===slot;
             const isHover = benchDragState2?.hoverSlot===slot;
-            const nm = player.name.length>10 ? player.name.slice(0,9)+"…" : player.name;
+            const nm = truncateLabel(fieldDisplayName(player, fieldNameMode), 10);
             const numLabel = showJerseyNum && player.num ? " #"+player.num : "";
             return (
               <g key={player.id} onPointerDown={e=>onCircleDown(e,slot)} style={{cursor:"grab",touchAction:"none"}}>
@@ -3108,7 +3174,7 @@ function FormationPlanner({ which, field, bench, pos, goals, setField, setBench,
         const d = dragRef.current;
         const player = field[d.slot];
         if (!player) return null;
-        const nm = player.name.length>8?player.name.slice(0,7)+"…":player.name;
+        const nm = truncateLabel(fieldDisplayName(player, fieldNameMode), 8);
         return (
           <div style={{position:"fixed",left:d.clientX-32,top:d.clientY-36,width:64,height:64,pointerEvents:"none",zIndex:9999}}>
             <svg width="64" height="64" viewBox="0 0 64 64">
