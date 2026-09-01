@@ -1,0 +1,3482 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no,viewport-fit=cover"/>
+<meta name="theme-color" content="#0d1f3c"/>
+<meta name="mobile-web-app-capable" content="yes"/>
+<meta name="apple-mobile-web-app-capable" content="yes"/>
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
+<meta name="apple-mobile-web-app-title" content="SubTracker"/>
+<link rel="manifest" href="./manifest.webmanifest"/>
+<link rel="icon" href="./icons/icon-192.png"/>
+<link rel="apple-touch-icon" href="./icons/icon-192.png"/>
+<title>Soccer Sub Tracker</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+html{height:100%;height:-webkit-fill-available}
+body{
+  height:100vh;height:100dvh;
+  width:100%;
+  overflow:hidden;
+  overscroll-behavior:none;
+  background:#071120;
+  font-family:system-ui,sans-serif;
+  /* Safe area insets for notch / home indicator */
+  padding-top:env(safe-area-inset-top);
+  padding-bottom:env(safe-area-inset-bottom);
+  padding-left:env(safe-area-inset-left);
+  padding-right:env(safe-area-inset-right);
+}
+#root{height:100%;display:flex;flex-direction:column}
+#loading{display:flex;align-items:center;justify-content:center;height:100%;color:#60a5fa;font-size:16px;font-weight:600}
+@keyframes subBlink{0%,100%{opacity:0}50%{opacity:1}}
+@keyframes planningPulse{0%,100%{box-shadow:0 0 0 2px #ea580c}50%{box-shadow:0 0 0 4px #f97316}}
+</style>
+</head>
+<body>
+<div id="root"><div id="loading">&#x26BD; Loading...</div></div>
+<script>
+// Surface any load/compile errors so the loading screen shows them
+window.onerror = function(msg, src, line, col, err) {
+  var el = document.getElementById('loading');
+  if (el) el.innerHTML = '&#x26A0; Error: ' + msg + (line ? ' (line ' + line + ')' : '');
+  return false;
+};
+</script>
+<script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone@7.24.7/babel.min.js"></script>
+<script type="text/babel" data-presets="react,env">
+const { useState, useEffect, useRef } = React;
+
+const FORMATIONS = { 11: [1, 4, 3, 3], 9: [1, 3, 2, 2], 7: [1, 2, 2, 1] };
+const DEFAULT_LINE_CONFIGS = { 11: [4, 3, 2, 1], 9: [3, 2, 2, 1], 7: [2, 2, 1, 1] };
+const FIELD_W = 360;
+const FIELD_H = 460;
+const STORAGE_KEY = "soccer_tracker_v2";
+
+function defaultLineConfig(size) {
+  return [...(DEFAULT_LINE_CONFIGS[size] || DEFAULT_LINE_CONFIGS[9])];
+}
+
+// Grid layout uses lineConfig [def, dm, am, fwd] with GK always = 1
+// Falls back to [5,5,5,5] if not provided
+function gridPoints(lineConfig) {
+  const rows = lineConfig ? [1, ...lineConfig] : [1,5,5,5,5];
+  const pts = [];
+  const numRows = rows.length;
+  const yTop = 38;
+  const yBottom = FIELD_H - 24;
+  rows.forEach((count, rowIdx) => {
+    // rowIdx 0 = GK (bottom of field, near goal)
+    // rowIdx (numRows-1) = forwards (top of field)
+    const t = rowIdx / (numRows - 1);
+    // flip so GK is near bottom (high y), forwards near top (low y)
+    const y = yBottom - t * (yBottom - yTop);
+    for (let c = 0; c < count; c++) {
+      const x = (FIELD_W / (count + 1)) * (c + 1);
+      pts.push({ x, y });
+    }
+  });
+  return pts;
+}
+
+function snapToNearestGridPoint(x, y, lineConfig) {
+  const pts = gridPoints(lineConfig);
+  let best = null, bestD = Infinity;
+  pts.forEach(p => {
+    const d = Math.hypot(x - p.x, y - p.y);
+    if (d < bestD) { bestD = d; best = p; }
+  });
+  return best || { x, y };
+}
+
+
+function defaultPositions(size, lineConfig) {
+  const base = FORMATIONS[size] || FORMATIONS[9];
+  // lineConfig overrides rows 1-4 (non-GK); row 0 is always [1] for GK
+  const rows = lineConfig
+    ? [1, ...lineConfig]
+    : base;
+  const positions = {};
+  let idx = 0;
+  rows.forEach((count, row) => {
+    for (let c = 0; c < count; c++) {
+      const x = (FIELD_W / (count + 1)) * (c + 1);
+      const y = 44 + ((FIELD_H - 88) / (rows.length - 1)) * (rows.length - 1 - row);
+      positions[idx] = { x, y };
+      idx++;
+    }
+  });
+  return positions;
+}
+
+function fmt(ms) {
+  const s = Math.floor(ms / 1000);
+  return `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
+}
+function fmtS(ms) {
+  if (!ms) return "0:00";
+  const s = Math.floor(ms / 1000);
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+}
+
+// Deterministic key: normalize name+num so same player on different teams merges
+function playerKey(name, num) {
+  return (name || "").trim().toLowerCase().replace(/\s+/g,"_") + "__" + (num || "").trim();
+}
+
+// Always-unique ID — timestamp + random suffix to prevent collisions on bulk import
+let _uidCounter = 0;
+function uid() {
+  return Date.now() + "_" + (++_uidCounter) + "_" + Math.random().toString(36).slice(2,7);
+}
+
+function loadTeams() {
+  try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || "[]"); } catch { return []; }
+}
+function persistTeams(teams) {
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(teams)); } catch {}
+}
+
+
+const STATS_KEY    = "soccer_player_stats_v1";
+const ROSTERS_KEY  = "soccer_rosters_v1";
+const GAMES_KEY    = "soccer_games_v1";
+
+// Roster: { id, name, isDefault, teamSize, players:[{id,name,num,lastName}] }
+function loadRosters() { try { return JSON.parse(localStorage.getItem(ROSTERS_KEY)||"[]"); } catch { return []; } }
+function persistRosters(r) { try { localStorage.setItem(ROSTERS_KEY, JSON.stringify(r)); } catch {} }
+
+// Games: { [gameId]: { id, teamName, opponent, date, competition, score, events,
+//           players:[{...playerWithStats}], teamSize } }
+function loadGames() { try { return JSON.parse(localStorage.getItem(GAMES_KEY)||"{}"); } catch { return {}; } }
+function persistGames(g) { try { localStorage.setItem(GAMES_KEY, JSON.stringify(g)); } catch {} }
+
+const GAME_SETUPS_KEY = "soccer_game_setups_v1";
+// Game setup (template): { id, name, teamName, teamSize, roster, h1Formation, h2Formation, opponent, competition, savedAt }
+function loadGameSetups() { try { return JSON.parse(localStorage.getItem(GAME_SETUPS_KEY)||"[]"); } catch { return []; } }
+function persistGameSetups(gs) { try { localStorage.setItem(GAME_SETUPS_KEY, JSON.stringify(gs)); } catch {} }
+
+function makeGameId(teamName, opponent, date) {
+  const d = date || new Date().toLocaleDateString();
+  return [teamName, opponent||"Unknown", d].join("_vs_").replace(/[^a-zA-Z0-9_]/g,"-");
+}
+
+// Stats schema per player:
+// { id, name, num, lastName, teams: [teamName],
+//   games: 0, goals: 0, totalMs: 0, gkMs: 0,
+//   yellowCards: 0, redCards: 0,
+//   h1Ms: 0, h2Ms: 0 }
+
+function loadStats() {
+  try { return JSON.parse(localStorage.getItem(STATS_KEY) || "{}"); } catch { return {}; }
+}
+function persistStats(stats) {
+  try { localStorage.setItem(STATS_KEY, JSON.stringify(stats)); } catch {}
+}
+
+function normalizeTeamName(team) {
+  return (team || "").trim();
+}
+
+function teamColor(team) {
+  const palette = [
+    { bg:"#0f2d45", border:"#1f6f9f", text:"#bae6fd" },
+    { bg:"#2d2448", border:"#7c3aed", text:"#ddd6fe" },
+    { bg:"#173225", border:"#15803d", text:"#bbf7d0" },
+    { bg:"#3a260d", border:"#b45309", text:"#fde68a" },
+    { bg:"#3a1520", border:"#be123c", text:"#fecdd3" },
+    { bg:"#262b18", border:"#84cc16", text:"#ecfccb" },
+  ];
+  let h = 0;
+  const s = normalizeTeamName(team).toLowerCase();
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+  return palette[h % palette.length];
+}
+
+function parseCSVRows(text) {
+  const rows = [];
+  let row = [], cell = "", inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    const next = text[i + 1];
+    if (ch === '"') {
+      if (inQuotes && next === '"') { cell += '"'; i++; }
+      else inQuotes = !inQuotes;
+    } else if (ch === "," && !inQuotes) {
+      row.push(cell.trim());
+      cell = "";
+    } else if ((ch === "\n" || ch === "\r") && !inQuotes) {
+      if (ch === "\r" && next === "\n") i++;
+      row.push(cell.trim());
+      if (row.some(c => c !== "")) rows.push(row);
+      row = [];
+      cell = "";
+    } else {
+      cell += ch;
+    }
+  }
+  row.push(cell.trim());
+  if (row.some(c => c !== "")) rows.push(row);
+  return rows;
+}
+
+function isJerseyValue(value) {
+  const v = String(value || "").trim().replace(/^#/, "");
+  return /^[0-9]{1,3}[A-Za-z]?$/.test(v);
+}
+
+function isHeaderRow(row) {
+  return row.some(c => /^(#|no\.?|num|number|jersey|jersey\s*#|player|name|full\s*name|first\s*name|team|club|squad)$/i.test(String(c || "").trim()));
+}
+
+function detectRosterColumns(rows) {
+  const header = rows.length && isHeaderRow(rows[0]) ? rows[0].map(c => String(c || "").trim().toLowerCase()) : null;
+  const dataRows = header ? rows.slice(1) : rows;
+  const colCount = Math.max(0, ...rows.map(r => r.length));
+  let numIdx = null, nameIdx = null, teamIdx = null;
+
+  if (header) {
+    header.forEach((h, i) => {
+      if (numIdx === null && /^(#|no\.?|num|number|jersey|jersey\s*#)$/.test(h)) numIdx = i;
+      if (nameIdx === null && /^(player|name|full\s*name|first\s*name|player\s*name)$/.test(h)) nameIdx = i;
+      if (teamIdx === null && /^(team|club|squad|group)$/.test(h)) teamIdx = i;
+    });
+  }
+
+  const stats = Array.from({ length: colCount }, (_, idx) => {
+    const values = dataRows.map(r => (r[idx] || "").trim()).filter(Boolean);
+    const unique = new Set(values.map(v => v.toLowerCase()));
+    const numeric = values.filter(isJerseyValue).length;
+    const repeats = values.length - unique.size;
+    const wordScore = values.reduce((sum, v) => sum + Math.min(3, v.split(/\s+/).filter(Boolean).length), 0);
+    return { idx, values, uniqueCount: unique.size, numeric, repeats, wordScore };
+  });
+
+  if (numIdx === null) {
+    const candidate = stats
+      .filter(s => s.values.length > 0)
+      .sort((a,b) => (b.numeric / b.values.length) - (a.numeric / a.values.length))[0];
+    if (candidate && candidate.numeric / candidate.values.length >= 0.6) numIdx = candidate.idx;
+  }
+
+  if (teamIdx === null) {
+    const candidate = stats
+      .filter(s => s.idx !== numIdx && s.values.length > 1)
+      .sort((a,b) => {
+        const aScore = a.repeats * 3 - a.wordScore / Math.max(1, a.values.length);
+        const bScore = b.repeats * 3 - b.wordScore / Math.max(1, b.values.length);
+        return bScore - aScore;
+      })[0];
+    if (candidate && candidate.repeats > 0) teamIdx = candidate.idx;
+  }
+
+  if (nameIdx === null) {
+    const candidate = stats
+      .filter(s => s.idx !== numIdx && s.idx !== teamIdx && s.values.length > 0)
+      .sort((a,b) => b.wordScore - a.wordScore)[0];
+    if (candidate) nameIdx = candidate.idx;
+  }
+
+  if (nameIdx === null) nameIdx = stats.find(s => s.idx !== numIdx && s.idx !== teamIdx)?.idx ?? 0;
+  return { numIdx, nameIdx, teamIdx, dataRows };
+}
+
+// ── Main App ──────────────────────────────────────────────────────────────────
+function App() {
+  const [screen, setScreen]       = useState("setup");
+  const [teamSize, setTeamSize]   = useState(9);
+  const [teamName, setTeamName]   = useState("My Team");
+  const [roster, setRoster]       = useState([]);       // setup-time list
+  const [newName, setNewName]     = useState("");
+  const [newNum, setNewNum]       = useState("");
+  const [savedTeams, setSaved]    = useState(loadTeams);   // legacy - kept for migration
+  const [rosters, setRosters]     = useState(loadRosters);
+  const [savedGames, setSavedGames] = useState(loadGames);
+  const [rosterModal, setRosterModal] = useState(false);   // load/save roster
+  const [gameListModal, setGameListModal] = useState(false); // load past game
+  const [saveRosterName, setSaveRosterName] = useState("");
+  const [loadModal, setLoadModal] = useState(false);
+  const [saveModal, setSaveModal] = useState(false);
+  const [saveName, setSaveName]   = useState("");
+  const [viewingGame, setViewingGame] = useState(null); // loaded game for summary view
+  const [gameSetups, setGameSetups] = useState(loadGameSetups);
+  const [gameSetupModal, setGameSetupModal] = useState(false); // "save"|"load"|false
+  const [lastLoadedSetupName, setLastLoadedSetupName] = useState("");
+  const [dataModal, setDataModal] = useState(false);
+  const [settingsModal, setSettingsModal] = useState(false);
+  const [showJerseyNum, setShowJerseyNum] = useState(true);
+  const [showPlayerTeam, setShowPlayerTeam] = useState(true);
+  const [showHalfCols, setShowHalfCols]     = useState(true);
+  const [snapToGrid, setSnapToGrid]         = useState(true);
+  const [showGrid, setShowGrid]             = useState(true);
+  const [subPlanMode, setSubPlanMode]       = useState(true); // reserved for future
+  const [tableSortCol, setTableSortCol]     = useState("shift");
+  const [tableSortDir, setTableSortDir]     = useState("asc"); // "asc"|"desc"
+  const [importText, setImportText] = useState("");
+  const [importError, setImportError] = useState("");
+  const [opponent, setOpponent]     = useState("");
+  const [gameDate, setGameDate]     = useState("");
+  const [competition, setCompetition] = useState("");
+  // Line configuration: [defenders, def-mid, att-mid, forwards] counts (excludes GK)
+  // Default from FORMATIONS based on teamSize; user can adjust +/-
+  const [lineConfig, setLineConfig] = useState(() => defaultLineConfig(9));
+
+  // Saved formations for planning
+  const [selectedPlayers, setSelectedPlayers] = useState(new Set()); // IDs of players assigned to game
+  const [h1Formation, setH1Formation] = useState(null); // {field, bench, pos}
+  const [h2Formation, setH2Formation] = useState(null);
+  // Which formation screen is open in setup: null | "h1" | "h2"
+  const [formationScreen, setFormationScreen] = useState(null);
+
+  // Game
+  // fieldPlayers: array indexed by slot (0..teamSize-1)
+  // Each: { id, name, num, isGK, shiftMs, totalMs, benchMs:0 }
+  const [field, setField]         = useState([]);
+  const [bench, setBench]         = useState([]);
+  // positions: { [slotIndex]: {x, y} }
+  const [pos, setPos]             = useState({});
+  const [gameMs, setGameMs]       = useState(0);
+  const [running, setRunning]     = useState(false);
+  const [gameEnded, setGameEnded] = useState(false);
+  const [statsModal, setStatsModal] = useState(false);
+  const [playerStats, setPlayerStats] = useState(loadStats);
+  const [half, setHalf]           = useState(1);
+  const [events, setEvents]       = useState([]);
+  const [score, setScore]         = useState({ us: 0, them: 0 });
+  const [goals, setGoals]         = useState({});       // { playerId: count }
+
+  // UI
+  const [selSlot, setSelSlot]     = useState(null);
+  const [modal, setModal]         = useState(null);     // "player"|"sub"|"card"|"log"
+  const [subSlot, setSubSlot]     = useState(null);
+  const [cardSlot, setCardSlot]   = useState(null);
+  const [drag, setDrag]           = useState(null);
+  const [gameView, setGameView]     = useState("field"); // "field" | "table"
+  const [fieldDragOver, setFieldDragOver] = useState(null); // benchIdx being hovered by field drag
+
+  const timerRef        = useRef(null);
+  const lastRef         = useRef(null);
+  const svgRef          = useRef(null);
+  const posRef           = useRef({});  // always-current mirror of pos state
+  const planFieldRef     = useRef([]);
+  const planBenchRef     = useRef([]);
+  const planPosRef       = useRef({});
+  const originalPosRef   = useRef({});  // snapshot of positions at drag-start (for stable hit-testing)
+  const benchContRef    = useRef(null);
+  const modalOpenedAt   = useRef(0);
+  const benchDragRef    = useRef(null);  // {benchIdx, x, y, hoverSlot, hoverStart}
+  const [benchDragState, setBenchDragState] = useState(null); // for rendering ghost + highlight
+  const [subPlanBase, setSubPlanBase] = useState(null); // live lineup snapshot when planning starts
+  const [planField, setPlanField] = useState(null);
+  const [planBench, setPlanBench] = useState(null);
+  const [planPos, setPlanPos] = useState(null);
+
+  // ── Timer ────────────────────────────────────────────────────────────────────
+  useEffect(() => {
+    if (running) {
+      lastRef.current = Date.now();
+      timerRef.current = setInterval(() => {
+        const now = Date.now();
+        const d   = now - lastRef.current;
+        lastRef.current = now;
+        setGameMs(t => t + d);
+        setField(fp => fp.map(p => ({ ...p, shiftMs: (p.shiftMs||0)+d, totalMs: (p.totalMs||0)+d, gkMs: (p.gkMs||0)+(p.isGK?d:0), h1Ms: (p.h1Ms||0)+(half===1?d:0), h2Ms: (p.h2Ms||0)+(half===2?d:0) })));
+        setBench(bp => bp.map(p => ({ ...p, benchMs: p.dns ? (p.benchMs||0) : (p.benchMs||0)+d })));
+      }, 500);
+    } else {
+      clearInterval(timerRef.current);
+    }
+    return () => clearInterval(timerRef.current);
+  }, [running]);
+
+  // Reset lineConfig when teamSize changes
+  useEffect(() => {
+    setLineConfig(defaultLineConfig(teamSize));
+  }, [teamSize]);
+  // so both halves use the same line structure
+  useEffect(() => {
+    if (formationScreen === "h1") {
+      // Keep the current half's hand-placed players stable; only invalidate H2
+      // so it regenerates with the updated line structure next time.
+      setH2Formation(null);
+    }
+  }, [lineConfig]); // eslint-disable-line
+
+  // Keep posRef always current so drag handlers bypass stale closures
+  useEffect(() => { posRef.current = pos; }, [pos]);
+  useEffect(() => { planFieldRef.current = planField || []; }, [planField]);
+  useEffect(() => { planBenchRef.current = planBench || []; }, [planBench]);
+  useEffect(() => { planPosRef.current = planPos || {}; }, [planPos]);
+
+  // ── Setup actions ─────────────────────────────────────────────────────────────
+
+  function exportAllRosters() {
+    const json = JSON.stringify(savedTeams, null, 2);
+    const blob = new Blob([json], {type:"application/json"});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = "soccer-rosters.json"; a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function importAllRosters(text) {
+    try {
+      const parsed = JSON.parse(text);
+      if (!Array.isArray(parsed)) throw new Error("Expected an array");
+      parsed.forEach(t => {
+        if (!t.name || !t.size || !Array.isArray(t.players)) throw new Error("Invalid team format");
+      });
+      const merged = [...savedTeams];
+      parsed.forEach(t => {
+        if (!merged.find(x => x.name === t.name)) merged.push(t);
+      });
+      setSaved(merged); persistTeams(merged);
+      setImportText(""); setImportError("");
+      alert("Imported " + parsed.length + " team(s) successfully.");
+    } catch(e) {
+      setImportError("Import failed: " + e.message);
+    }
+  }
+
+  function addPlayer() {
+    const n = newName.trim(); if (!n) return;
+    const id = uid();
+    setRoster(r => [...r, { id, name: n, num: newNum.trim(), team: "" }]);
+    setSelectedPlayers(s => new Set([...s, id])); // auto-select new players
+    setH1Formation(null); setH2Formation(null);
+    setNewName(""); setNewNum("");
+  }
+
+  function removePlayer(id) {
+    setRoster(r => r.filter(p => p.id !== id));
+    setSelectedPlayers(s => { const next = new Set(s); next.delete(id); return next; });
+    setH1Formation(null); setH2Formation(null);
+  }
+
+  function togglePlayerSelected(id) {
+    setSelectedPlayers(s => {
+      const next = new Set(s);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+    setH1Formation(null); setH2Formation(null);
+  }
+
+  function selectAllPlayers() {
+    setSelectedPlayers(new Set(roster.map(p => p.id)));
+    setH1Formation(null); setH2Formation(null);
+  }
+
+  function clearAllSelected() {
+    setSelectedPlayers(new Set());
+    setH1Formation(null); setH2Formation(null);
+  }
+
+  function selectPlayersByTeam(team) {
+    const target = normalizeTeamName(team);
+    setSelectedPlayers(new Set(roster.filter(p => normalizeTeamName(p.team) === target).map(p => p.id)));
+    setH1Formation(null); setH2Formation(null);
+  }
+
+  function changeTeamSize(n) {
+    setTeamSize(n);
+    setH1Formation(null); setH2Formation(null);
+  }
+
+  // Open the formation planner for h1 or h2
+  function openFormation(which) {
+    const selCount = [...selectedPlayers].filter(id => roster.find(p=>p.id===id)).length;
+    if (selCount < teamSize) return;
+    const existing = which==="h1" ? h1Formation : h2Formation;
+    if (existing) {
+      // Restore saved formation; if opening h2 and it has no DNS data, carry from h1
+      if (which === "h2" && h1Formation) {
+        const dnsById = {};
+        h1Formation.bench.forEach(p => { dnsById[p.id] = p.dns || false; });
+        setField(existing.field.map(p => ({ ...p })));
+        setBench(existing.bench.map(p => ({ ...p, dns: p.dns ?? (dnsById[p.id] || false) })));
+      } else {
+        setField(existing.field);
+        setBench(existing.bench);
+      }
+      setPos(existing.pos);
+    } else {
+      // Build from selected players; first teamSize go on field, rest on bench
+      const selected = roster.filter(p => selectedPlayers.has(p.id));
+      const active = selected.length >= teamSize ? selected : roster; // fallback to all if none selected
+      // When building h2 from scratch, carry DNS flags from h1 bench if available
+      const h1DnsById = {};
+      if (which === "h2" && h1Formation) {
+        h1Formation.bench.forEach(p => { h1DnsById[p.id] = p.dns || false; });
+      }
+      setField(active.slice(0, teamSize).map((p, i) => ({ ...p, slot: i, isGK: i===0, shiftMs:0, totalMs:0, benchMs:0, gkMs:0, h1Ms:0, h2Ms:0 })));
+      setBench(active.slice(teamSize).map(p => ({ ...p, shiftMs:0, totalMs:0, benchMs:0, gkMs:0, h1Ms:0, h2Ms:0, dns: h1DnsById[p.id] || false })));
+      setPos(defaultPositions(teamSize, lineConfig));
+    }
+    setFormationScreen(which);
+    setScreen("game");
+  }
+
+  // Save current formation layout back to h1 or h2
+  function saveFormation(which) {
+    const formation = { field: field.map(p=>({...p})), bench: bench.map(p=>({...p})), pos: {...pos} };
+    if (which==="h1") setH1Formation(formation);
+    else setH2Formation(formation);
+  }
+
+  // Actually start the game — always uses h1 formation regardless of which screen called it
+  function launchGame(which) {
+    // Save current screen's formation first
+    const savedWhich = { field: field.map(p=>({...p})), bench: bench.map(p=>({...p})), pos: {...pos} };
+    if (which==="h1") setH1Formation(savedWhich);
+    else setH2Formation(savedWhich);
+    // Use h1Formation if it exists, else use current field state (which IS h1 if called from h1 screen)
+    const f1 = (which==="h1" ? savedWhich : h1Formation) || savedWhich;
+    setField(f1.field.map(p=>({...p, shiftMs:0, totalMs:0, benchMs:0, gkMs:0, h1Ms:0, h2Ms:0})));
+    setBench(f1.bench.map(p=>({...p, shiftMs:0, totalMs:0, benchMs:0, gkMs:0, h1Ms:0, h2Ms:0})));
+    setPos(f1.pos);
+    // Build initial events: kickoff + one DNS log per absent bench player
+    const kickoffEvt = { time:"00:00", text:"▶ Kickoff — 1st half" };
+    const dnsEvts = f1.bench
+      .filter(p => p.dns)
+      .map(p => ({ time:"00:00", text:`🚫 DNS: ${p.num?"#"+p.num+" ":""}${p.name} — did not show` }));
+    setEvents([kickoffEvt, ...dnsEvts]);
+    setScore({us:0,them:0}); setGoals({}); setHalf(1);
+    if (!gameDate) setGameDate(new Date().toLocaleDateString());
+    setRunning(true);
+    setGameEnded(false);
+    setFormationScreen(null);
+    setScreen("game");
+  }
+
+  // ── Game setup templates ──────────────────────────────────────────────────────
+  function saveGameSetup(name) {
+    const n = (name || (teamName + " vs " + (opponent||"TBD"))).trim();
+    const gs = {
+      id: Date.now(),
+      name: n,
+      teamName, teamSize, lineConfig,
+      roster: roster.map(p => ({...p})),
+      selectedPlayerIds: [...selectedPlayers],
+      h1Formation: h1Formation ? JSON.parse(JSON.stringify(h1Formation)) : null,
+      h2Formation: h2Formation ? JSON.parse(JSON.stringify(h2Formation)) : null,
+      opponent: opponent || "",
+      competition: competition || "",
+      savedAt: Date.now(),
+    };
+    setGameSetups(prev => {
+      const updated = [...prev.filter(x => x.name !== n), gs];
+      persistGameSetups(updated);
+      return updated;
+    });
+    setGameSetupModal(false);
+  }
+
+  function loadGameSetup(gs) {
+    setTeamName(gs.teamName || teamName);
+    setTeamSize(gs.teamSize || 9);
+    const gsPlayers = (gs.roster||[]).map(p => ({...p, id: p.id || uid(), team: p.team || ""}));
+    setRoster(gsPlayers);
+    if (gs.selectedPlayerIds && gs.selectedPlayerIds.length > 0) {
+      setSelectedPlayers(new Set(gs.selectedPlayerIds));
+    } else {
+      setSelectedPlayers(new Set(gsPlayers.map(p => p.id)));
+    }
+    setH1Formation(gs.h1Formation || null);
+    setH2Formation(gs.h2Formation || null);
+    if (gs.lineConfig) setLineConfig(gs.lineConfig);
+    setOpponent(gs.opponent || "");
+    setCompetition(gs.competition || "");
+    setGameDate(""); // fresh date each time
+    setLastLoadedSetupName(gs.name || "");
+    setGameSetupModal(false);
+  }
+
+  function deleteGameSetup(id) {
+    setGameSetups(prev => {
+      const updated = prev.filter(x => x.id !== id);
+      persistGameSetups(updated);
+      return updated;
+    });
+  }
+
+  // ── Roster management ─────────────────────────────────────────────────────────
+  function saveRoster(nameOverride) {
+    const name = (nameOverride || saveRosterName || teamName).trim();
+    if (!name || roster.length === 0) return;
+    const r = {
+      id: Date.now(),
+      name,
+      teamSize,
+      isDefault: false,
+      players: roster.map(p => ({ id: p.id, name: p.name, num: p.num || "", lastName: p.lastName || "", team: p.team || "" })),
+      selectedPlayerIds: [...selectedPlayers],
+      h1Formation: h1Formation || null,
+      h2Formation: h2Formation || null,
+    };
+    setRosters(prev => {
+      const updated = [...prev.filter(x => x.name !== name), r];
+      persistRosters(updated);
+      return updated;
+    });
+    setSaveRosterName("");
+    setRosterModal(false);
+  }
+
+  function loadRoster(r) {
+    setTeamName(r.name);
+    setTeamSize(r.teamSize || 9);
+    const players = r.players.map((p, i) => ({
+      id: p.id || uid(),
+      name: p.name,
+      num: p.num || "",
+      lastName: p.lastName || "",
+      team: p.team || "",
+    }));
+    setRoster(players);
+    // Restore selected players if saved, otherwise select all
+    if (r.selectedPlayerIds && r.selectedPlayerIds.length > 0) {
+      setSelectedPlayers(new Set(r.selectedPlayerIds));
+    } else {
+      setSelectedPlayers(new Set(players.map(p => p.id)));
+    }
+    setH1Formation(r.h1Formation || null);
+    setH2Formation(r.h2Formation || null);
+    setRosterModal(false);
+  }
+
+  function setDefaultRoster(id) {
+    setRosters(prev => {
+      const updated = prev.map(r => ({ ...r, isDefault: r.id === id }));
+      persistRosters(updated);
+      return updated;
+    });
+  }
+
+  function deleteRoster(id) {
+    setRosters(prev => {
+      const updated = prev.filter(r => r.id !== id);
+      persistRosters(updated);
+      return updated;
+    });
+  }
+
+  function importRosterCSV(text) {
+    const rows = parseCSVRows(text);
+    const { numIdx, nameIdx, teamIdx, dataRows } = detectRosterColumns(rows);
+    const players = dataRows.map(cols => {
+      const rawName = (cols[nameIdx] || "").trim();
+      if (!rawName || /^(player|name|full\s*name|first\s*name)$/i.test(rawName)) return null;
+      const rawNum = numIdx !== null ? (cols[numIdx] || "").trim().replace(/^#/, "") : "";
+      const team = teamIdx !== null ? normalizeTeamName(cols[teamIdx]) : "";
+      return {
+        id: uid(),
+        name: rawName,
+        num: rawNum || "",
+        lastName: "",
+        team,
+      };
+    }).filter(Boolean);
+    if (players.length > 0) {
+      setRoster(players);
+      setSelectedPlayers(new Set(players.map(p => p.id)));
+      setH1Formation(null); setH2Formation(null);
+    }
+    return players.length;
+  }
+
+  // ── Game persistence ───────────────────────────────────────────────────────────
+  function saveCurrentGame() {
+    const id = makeGameId(teamName, opponent, gameDate);
+    const game = {
+      id,
+      teamName,
+      opponent: opponent || "Unknown",
+      date: gameDate || new Date().toLocaleDateString(),
+      competition: competition || "",
+      teamSize,
+      lineConfig,
+      score: { ...score },
+      events: [...events],
+      goals: { ...goals },
+      players: [...field.map(p=>({...p,status:"field"})), ...bench.map(p=>({...p,status:p.ejected?"ejected":"bench"}))],
+      savedAt: Date.now(),
+    };
+    setSavedGames(prev => {
+      const updated = { ...prev, [id]: game };
+      persistGames(updated);
+      return updated;
+    });
+    return id;
+  }
+
+  function deleteGame(id) {
+    setSavedGames(prev => {
+      const updated = { ...prev };
+      delete updated[id];
+      persistGames(updated);
+      return updated;
+    });
+  }
+
+  function loadGameSummary(game) {
+    setViewingGame(game);
+    setGameListModal(false);
+    setScreen("summary");
+  }
+
+  function exportGameCSV(game) {
+    const esc = v => `"${String(v||"").replace(/"/g,'""')}"`;
+    const rows = [];
+    rows.push(["GAME", game.id]);
+    rows.push(["Date", game.date, "Opponent", game.opponent, "Competition", game.competition||""]);
+    rows.push(["Score", game.teamName + " " + game.score.us + " : " + game.score.them + " " + game.opponent]);
+    rows.push([]);
+    rows.push(["#","Name","Last Name","Status","Played","H1","H2","GK","Goals"]);
+    (game.players||[]).forEach(p=>{
+      rows.push([p.num||"",p.name,p.lastName||"",p.status||"",
+        fmtS(p.totalMs||0),fmtS(p.h1Ms||0),fmtS(p.h2Ms||0),fmtS(p.gkMs||0),
+        game.goals?.[p.id]||0]);
+    });
+    rows.push([]);
+    rows.push(["EVENT LOG"]);
+    (game.events||[]).forEach(ev=>rows.push([ev.time, ev.text]));
+    const csv = rows.map(r=>r.map(esc).join(",")).join("\r\n");
+    const blob = new Blob(["\uFEFF"+csv],{type:"text/csv;charset=utf-8;"});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href=url; a.download=game.id+".csv"; a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function saveTeam() {
+    const name = saveName.trim() || teamName;
+    const t = {
+      name, size: teamSize,
+      players: roster.map(p => ({ name: p.name, num: p.num, team: p.team || "" })),
+      h1Formation: h1Formation || null,
+      h2Formation: h2Formation || null,
+    };
+    const updated = [...savedTeams.filter(x => x.name !== name), t];
+    setSaved(updated); persistTeams(updated); setSaveModal(false); setSaveName("");
+  }
+
+  function loadTeam(t) {
+    setTeamName(t.name); setTeamSize(t.size);
+    setRoster(t.players.map((p, i) => ({ id: uid(), name: typeof p==="string"?p:p.name, num: typeof p==="string"?"":p.num||"", team: typeof p==="string"?"":p.team||"" })));
+    setH1Formation(t.h1Formation || null);
+    setH2Formation(t.h2Formation || null);
+    setLoadModal(false);
+  }
+
+  // ── Game actions ──────────────────────────────────────────────────────────────
+
+  function saveGameToStats() {
+    const all = [...field, ...bench];
+    const cardEvents = {};
+    events.forEach(ev => {
+      const ym = ev.text.match(/YELLOW CARD: (.+)$/i);
+      const rm = ev.text.match(/RED CARD: (.+)$/i);
+      if (ym) { const k=ym[1].trim(); cardEvents[k] = cardEvents[k]||{y:0,r:0}; cardEvents[k].y++; }
+      if (rm) { const k=rm[1].trim(); cardEvents[k] = cardEvents[k]||{y:0,r:0}; cardEvents[k].r++; }
+    });
+    setPlayerStats(prev => {
+      const next = { ...prev };
+      all.forEach(p => {
+        const key = playerKey(p.name, p.num);
+        const existing = next[key] || {
+          id: key, name: p.name, num: p.num || "", lastName: "",
+          teams: [], competitions: [], games: 0, goals: 0, totalMs: 0, gkMs: 0,
+          h1Ms: 0, h2Ms: 0, yellowCards: 0, redCards: 0,
+        };
+        const cardKey = (p.num ? "#"+p.num+" " : "") + p.name;
+        const cards = cardEvents[cardKey] || {y:0, r:0};
+        const comp = competition || "";
+        // Count goals scored while this player was on the field
+        const pKey = playerKey(p.name, p.num);
+        const goalsFor     = events.filter(ev => ev.forTeam  && ev.fieldIds?.includes(pKey)).length;
+        const goalsAgainst = events.filter(ev => ev.forTeam===false && ev.fieldIds?.includes(pKey)).length;
+        next[key] = {
+          ...existing,
+          name: p.name, num: p.num || "",
+          teams: existing.teams.includes(teamName) ? existing.teams : [...existing.teams, teamName],
+          competitions: comp && !(existing.competitions||[]).includes(comp) ? [...(existing.competitions||[]), comp] : (existing.competitions||[]),
+          games:         existing.games + 1,
+          goals:         existing.goals + (goals[p.id] || 0),
+          goalsFor:      (existing.goalsFor||0) + goalsFor,
+          goalsAgainst:  (existing.goalsAgainst||0) + goalsAgainst,
+          totalMs:       existing.totalMs + (p.totalMs || 0),
+          gkMs:          existing.gkMs + (p.gkMs || 0),
+          h1Ms:          existing.h1Ms + (p.h1Ms || 0),
+          h2Ms:          existing.h2Ms + (p.h2Ms || 0),
+          yellowCards:   existing.yellowCards + cards.y,
+          redCards:      existing.redCards + cards.r,
+        };
+      });
+      persistStats(next);
+      return next;
+    });
+  }
+
+  function addEvt(text) {
+    setEvents(ev => [...ev, { time: fmt(gameMs), text }]);
+  }
+
+  function playerLabel(p) {
+    if (!p) return "Unknown";
+    return (p.num ? "#" + p.num + " " : "") + p.name;
+  }
+
+  function cloneLineup(arr) {
+    return (arr || []).map(p => ({ ...p }));
+  }
+
+  function activeField() {
+    return subPlanBase ? planFieldRef.current : field;
+  }
+
+  function activeBench() {
+    return subPlanBase ? planBenchRef.current : bench;
+  }
+
+  function activePos() {
+    return subPlanBase ? planPosRef.current : pos;
+  }
+
+  function setActiveField(updater) {
+    subPlanBase ? setPlanField(updater) : setField(updater);
+  }
+
+  function setActiveBench(updater) {
+    subPlanBase ? setPlanBench(updater) : setBench(updater);
+  }
+
+  function setActivePos(updater) {
+    subPlanBase ? setPlanPos(updater) : setPos(updater);
+  }
+
+  function enterSubPlanning() {
+    setGameView("field");
+    setModal(null);
+    setSelSlot(null);
+    setSubSlot(null);
+    setSubPlanBase({
+      field: cloneLineup(field),
+      bench: cloneLineup(bench),
+      pos: { ...pos },
+    });
+    setPlanField(cloneLineup(field));
+    setPlanBench(cloneLineup(bench));
+    setPlanPos({ ...pos });
+  }
+
+  function cancelSubPlanning() {
+    setSubPlanBase(null);
+    setPlanField(null);
+    setPlanBench(null);
+    setPlanPos(null);
+    setModal(null);
+    setSelSlot(null);
+    setSubSlot(null);
+  }
+
+  function buildSubPlanSummary() {
+    if (!subPlanBase || !planField || !planBench) return { ops: [], hasChanges: false };
+    const baseField = subPlanBase.field || [];
+    const targetField = planField || [];
+    const basePos = subPlanBase.pos || {};
+    const targetPos = planPos || {};
+    const baseFieldIds = baseField.map(p => p.id);
+    const targetFieldIds = targetField.map(p => p.id);
+    const byId = {};
+    [...baseField, ...(subPlanBase.bench || []), ...targetField, ...planBench].forEach(p => { byId[p.id] = p; });
+    const posKey = p => p ? `${Math.round(p.x)}:${Math.round(p.y)}` : "";
+    const samePos = (a, b) => posKey(a) === posKey(b);
+
+    const sim = baseFieldIds.slice();
+    const simPos = baseField.map((_, slot) => ({ ...(basePos[slot] || {}) }));
+    const ops = [];
+    const incomingSlots = targetFieldIds
+      .map((id, slot) => ({ id, slot }))
+      .filter(x => !baseFieldIds.includes(x.id));
+
+    incomingSlots.forEach(({ id, slot }) => {
+      const outId = sim[slot];
+      ops.push({
+        type: "sub",
+        inP: byId[id],
+        outP: byId[outId],
+      });
+      sim[slot] = id;
+    });
+
+    for (let slot = 0; slot < targetFieldIds.length; slot++) {
+      if (sim[slot] === targetFieldIds[slot]) continue;
+      const swapSlot = sim.findIndex(id => id === targetFieldIds[slot]);
+      if (swapSlot >= 0) {
+        ops.push({
+          type: "swap",
+          a: byId[sim[slot]],
+          b: byId[sim[swapSlot]],
+        });
+        [sim[slot], sim[swapSlot]] = [sim[swapSlot], sim[slot]];
+        [simPos[slot], simPos[swapSlot]] = [simPos[swapSlot], simPos[slot]];
+      }
+    }
+
+    for (let slot = 0; slot < targetFieldIds.length; slot++) {
+      if (samePos(simPos[slot], targetPos[slot])) continue;
+      const swapSlot = simPos.findIndex((p, idx) => idx !== slot && samePos(p, targetPos[slot]));
+      if (swapSlot >= 0) {
+        ops.push({
+          type: "swap",
+          a: byId[sim[slot]],
+          b: byId[sim[swapSlot]],
+        });
+        [simPos[slot], simPos[swapSlot]] = [simPos[swapSlot], simPos[slot]];
+      } else {
+        ops.push({
+          type: "move",
+          p: byId[sim[slot]],
+        });
+      }
+    }
+
+    return {
+      ops,
+      hasChanges:
+        baseFieldIds.join("|") !== targetFieldIds.join("|") ||
+        baseField.some((_, slot) => !samePos(basePos[slot], targetPos[slot])),
+    };
+  }
+
+  function reviewSubPlan() {
+    setModal("subPlanSummary");
+  }
+
+  function executeSubPlan() {
+    const summary = buildSubPlanSummary();
+    const liveById = {};
+    [...field, ...bench].forEach(p => { liveById[p.id] = p; });
+    const liveFieldIds = new Set(field.map(p => p.id));
+    const finalField = (planField || []).map((p, slot) => {
+      const live = liveById[p.id] || p;
+      return {
+        ...live,
+        ...p,
+        slot,
+        shiftMs: liveFieldIds.has(p.id) ? (live.shiftMs || 0) : 0,
+        totalMs: live.totalMs || 0,
+        benchMs: live.benchMs || 0,
+        gkMs: live.gkMs || 0,
+        h1Ms: live.h1Ms || 0,
+        h2Ms: live.h2Ms || 0,
+        dns: false,
+      };
+    });
+    const finalBench = (planBench || []).map(p => {
+      const live = liveById[p.id] || p;
+      return {
+        ...live,
+        ...p,
+        totalMs: live.totalMs || 0,
+        benchMs: live.benchMs || 0,
+        gkMs: live.gkMs || 0,
+        h1Ms: live.h1Ms || 0,
+        h2Ms: live.h2Ms || 0,
+      };
+    });
+    setField(finalField);
+    setBench(finalBench);
+    setPos({ ...(planPos || pos) });
+    summary.ops.forEach(op => {
+      if (op.type === "sub") addEvt(`🔄 ${playerLabel(op.inP)} IN for ${playerLabel(op.outP)}`);
+      else if (op.type === "swap") addEvt(`↔ Position swap: ${playerLabel(op.a)} ⇄ ${playerLabel(op.b)}`);
+      else addEvt(`↔ Position move: ${playerLabel(op.p)}`);
+    });
+    cancelSubPlanning();
+  }
+
+  function startHalf() {
+    setRunning(true);
+    addEvt(half===1 ? "▶ Kickoff — 1st half" : "▶ Kickoff — 2nd half");
+    // Log any still-DNS players at the start of 2nd half
+    if (half === 2) {
+      bench.filter(p => p.dns).forEach(p =>
+        addEvt(`🚫 DNS: ${p.num?"#"+p.num+" ":""}${p.name} — still not present`)
+      );
+    }
+  }
+
+  function doHalfTime() {
+    setRunning(false);
+    setGameMs(0);  // clock resets
+    addEvt("⏸ Half time");
+    // Log DNS players still absent at half time
+    bench.filter(p=>p.dns).forEach(p=>addEvt(`🚫 DNS at half time: ${p.num?"#"+p.num+" ":""}${p.name}`));
+    // Build a dns-status lookup from current bench (so DNS carries into h2)
+    const dnsByIdCurrentBench = {};
+    bench.forEach(p => { dnsByIdCurrentBench[p.id] = p.dns || false; });
+    // Load h2 formation if saved, preserving accumulated totalMs/gkMs/h1Ms for each player
+    if (h2Formation) {
+      // Merge: use h2 positions/assignments but carry forward timing from current state
+      const timingById = {};
+      [...field, ...bench].forEach(p => { timingById[p.id] = { totalMs: p.totalMs||0, gkMs: p.gkMs||0, h1Ms: p.h1Ms||0, dns: p.dns||false }; });
+      const mergedField = h2Formation.field.map(p => ({
+        ...p,
+        shiftMs: 0,
+        totalMs: timingById[p.id]?.totalMs || p.totalMs || 0,
+        gkMs:    timingById[p.id]?.gkMs    || p.gkMs    || 0,
+        h1Ms:    timingById[p.id]?.h1Ms    || p.h1Ms    || 0,
+        h2Ms: 0,
+        benchMs: 0,
+        dns: false, // field players in h2 are assumed present
+      }));
+      const mergedBench = h2Formation.bench.map(p => ({
+        ...p,
+        shiftMs: 0,
+        totalMs: timingById[p.id]?.totalMs || p.totalMs || 0,
+        gkMs:    timingById[p.id]?.gkMs    || p.gkMs    || 0,
+        h1Ms:    timingById[p.id]?.h1Ms    || p.h1Ms    || 0,
+        h2Ms: 0,
+        benchMs: 0,
+        // Carry DNS flag: use live bench status first, then h2Formation's stored flag
+        dns: timingById[p.id]?.dns ?? (p.dns || false),
+      }));
+      setField(mergedField);
+      setBench(mergedBench);
+      setPos(h2Formation.pos);
+    } else {
+      // No h2 formation saved — reset shifts, keep dns flags on bench
+      setField(fp => fp.map(p => ({ ...p, shiftMs: 0 })));
+      // Carry DNS flags into bench for h2
+      setBench(bp => bp.map(p => ({ ...p, shiftMs: 0, dns: dnsByIdCurrentBench[p.id] ?? p.dns ?? false })));
+    }
+    setHalf(2);
+  }
+
+  function endGame() {
+    setRunning(false);
+    addEvt(`🏁 Full time — ${score.us}:${score.them}`);
+    setGameEnded(true);
+    saveCurrentGame();  // persist game record to savedGames
+    setScreen("summary");
+  }
+
+  function goalForSlot(slot) {
+    const p = field[slot]; if (!p) return;
+    setScore(s => ({ ...s, us: s.us+1 }));
+    setGoals(g => ({ ...g, [p.id]: (g[p.id]||0)+1 }));
+    // Record which players were on the field at time of goal
+    const fieldIds = field.map(fp => playerKey(fp.name, fp.num));
+    setEvents(ev => [...ev, { time: fmt(gameMs), text: `⚽ GOAL: ${p.num?"#"+p.num+" ":""}${p.name}`, forTeam: true, scorerId: playerKey(p.name, p.num), fieldIds }]);
+    setModal(null); setSelSlot(null);
+  }
+
+  function oppGoal() {
+    setScore(s => ({ ...s, them: s.them+1 }));
+    const fieldIds = field.map(fp => playerKey(fp.name, fp.num));
+    setEvents(ev => [...ev, { time: fmt(gameMs), text: "⚽ GOAL: Opponent", forTeam: false, fieldIds }]);
+  }
+
+  function doSub(benchP) {
+    const slot = subSlot;
+    const out  = activeField()[slot];
+    setActiveField(fp => { const n=[...fp]; n[slot]={...benchP, slot, isGK:out.isGK, shiftMs:0, totalMs:benchP.totalMs||0, benchMs:benchP.benchMs||0, gkMs:benchP.gkMs||0, h1Ms:benchP.h1Ms||0, h2Ms:benchP.h2Ms||0}; return n; });
+    setActiveBench(bp => bp.filter(p=>p.id!==benchP.id).concat([{...out, benchMs:out.benchMs||0}]));
+    if (!subPlanBase) addEvt(`🔄 ${benchP.num?"#"+benchP.num+" ":""}${benchP.name} IN for ${out.num?"#"+out.num+" ":""}${out.name}`);
+    setSubSlot(null); setModal(null); setSelSlot(null);
+  }
+
+
+  function assignGK(slot) {
+    // Makes slot the GK, removes GK from any other player. If they're already GK, remove it (so you can unmark).
+    setActiveField(fp => fp.map((p, i) => {
+      if (i === slot) return { ...p, isGK: !p.isGK };   // toggle for the tapped player
+      return { ...p, isGK: false };                       // clear GK from everyone else
+    }));
+    const p = activeField()[slot];
+    const willBeGK = !p.isGK;
+    if (!subPlanBase) addEvt(willBeGK ? `★ GK assigned: ${p.num?"#"+p.num+" ":""}${p.name}` : `★ GK removed: ${p.num?"#"+p.num+" ":""}${p.name}`);
+    setModal(null); setSelSlot(null);
+  }
+
+  function giveCard(slot, type) {
+    const p = field[slot];
+    const label = (p.num ? "#"+p.num+" " : "") + p.name;
+    addEvt((type==="yellow" ? "🟨" : "🟥") + " " + type.toUpperCase() + " CARD: " + label);
+    if (type === "red") {
+      // Remove from field, add to bench as permanently ejected
+      setField(fp => fp.filter((_, i) => i !== slot));
+      setPos(ps => {
+        const next = {};
+        Object.entries(ps).forEach(([k, v]) => {
+          const ki = parseInt(k);
+          if (ki < slot) next[ki] = v;
+          else if (ki > slot) next[ki - 1] = v;
+        });
+        return next;
+      });
+      setBench(bp => [...bp, { ...p, ejected: true, benchMs: p.benchMs || 0 }]);
+      addEvt("🚫 " + label + " ejected — down to " + (field.length - 1) + " players");
+    }
+    setCardSlot(null); setModal(null); setSelSlot(null);
+  }
+
+  // ── Drag & tap — window-level so circle can follow finger into bench area ──────
+  const dragRef2  = useRef(null);
+  const [blinkSlot, setBlinkSlot] = useState(null); // slot to blink after sub
+  const [blinkSlot2, setBlinkSlot2] = useState(null); // second slot for position swaps
+  const [fieldHoverSlot, setFieldHoverSlot] = useState(null); // field player hovered during drag
+
+  function svgPt(clientX, clientY) {
+    const svg = svgRef.current; if (!svg) return null;
+    const r = svg.getBoundingClientRect();
+    // No clamping — let the circle follow the finger anywhere
+    return {
+      x: ((clientX - r.left) / r.width)  * FIELD_W,
+      y: ((clientY - r.top)  / r.height) * FIELD_H,
+    };
+  }
+
+  function getBenchIdxAt(clientX, clientY) {
+    const bc = benchContRef.current; if (!bc) return null;
+    const r = bc.getBoundingClientRect();
+    if (clientY < r.top || clientY > r.bottom || clientX < r.left || clientX > r.right) return null;
+    let found = null;
+    bc.querySelectorAll('[data-benchidx]').forEach(el => {
+      const er = el.getBoundingClientRect();
+      if (clientX >= er.left && clientX <= er.right && clientY >= er.top && clientY <= er.bottom)
+        found = parseInt(el.getAttribute('data-benchidx'));
+    });
+    return found;
+  }
+
+  function getFieldPoint(clientX, clientY) {
+    const svg = svgRef.current; if (!svg) return null;
+    const r = svg.getBoundingClientRect();
+    return {
+      x: ((clientX - r.left) / r.width)  * FIELD_W,
+      y: ((clientY - r.top)  / r.height) * FIELD_H,
+    };
+  }
+
+  function getSubTargetSlotAtPoint(clientX, clientY) {
+    const pt = getFieldPoint(clientX, clientY);
+    if (!pt) return null;
+    let best = null, bestD = 62;
+    activeField().forEach((_, slot) => {
+      const fp = activePos()[slot] || { x:50, y:50 };
+      const d = Math.hypot(pt.x - fp.x, pt.y - fp.y);
+      if (d < bestD) { bestD = d; best = slot; }
+    });
+    return best;
+  }
+
+  function getSwapTargetSlotAtPoint(clientX, clientY, excludeSlot) {
+    const pt = getFieldPoint(clientX, clientY);
+    if (!pt) return null;
+    // Use frozen positions from drag-start so target players do not drift.
+    const stablePos = originalPosRef.current;
+    let best = null, bestD = 34;
+    activeField().forEach((_, slot) => {
+      if (slot === excludeSlot) return;
+      const fp = stablePos[slot] || activePos()[slot] || { x:50, y:50 };
+      const d = Math.hypot(pt.x - fp.x, pt.y - fp.y);
+      if (d < bestD) { bestD = d; best = slot; }
+    });
+    return best;
+  }
+
+  function triggerBlink(slot, slot2) {
+    setBlinkSlot(slot);
+    if (slot2 !== undefined) setBlinkSlot2(slot2);
+    setTimeout(() => { setBlinkSlot(null); setBlinkSlot2(null); }, 800);
+  }
+
+  // Window-level drag listeners attached/removed via useEffect
+  useEffect(() => {
+    if (!drag) return;
+
+    function handleMove(e) {
+      const t = e.touches?.[0] || e;
+      const cx = t.clientX, cy = t.clientY;
+      const d = dragRef2.current; if (!d) return;
+      const dx = cx - d.startClient.x, dy = cy - d.startClient.y;
+      if (!d.moved && Math.hypot(dx, dy) < 8) return;
+      if (e.cancelable) e.preventDefault();
+
+      // Move the dragged circle to follow the finger
+      const pt = svgPt(cx, cy);
+      if (pt) {
+        setActivePos(ps => ({ ...ps, [d.slot]: { x: pt.x - d.ox, y: pt.y - d.oy } }));
+      }
+
+      dragRef2.current = { ...d, moved: true, clientX: cx, clientY: cy };
+
+      // Highlight: use originalPosRef so targets don't drift
+      setFieldDragOver(getBenchIdxAt(cx, cy));
+      setFieldHoverSlot(getBenchIdxAt(cx, cy) !== null ? null : getSwapTargetSlotAtPoint(cx, cy, d.slot));
+      if (!d.moved) setDrag(dv => dv ? { ...dv, moved: true } : dv);
+    }
+
+    function handleUp(e) {
+      const t = e.changedTouches?.[0] || e;
+      const d = dragRef2.current;
+      dragRef2.current = null;
+      setFieldDragOver(null);
+      setFieldHoverSlot(null);
+      window.removeEventListener('pointermove', handleMove);
+      window.removeEventListener('pointerup',   handleUp);
+      window.removeEventListener('touchmove',   handleMove);
+      window.removeEventListener('touchend',    handleUp);
+
+      if (!d) { originalPosRef.current = {}; setDrag(null); return; }
+
+      if (!d.moved) {
+        modalOpenedAt.current = Date.now();
+        setSelSlot(d.slot);
+        setModal("player");
+        originalPosRef.current = {};
+        setDrag(null);
+        return;
+      }
+
+      // ── Find swap target using originalPosRef (stable positions) ────────────
+      // Rule: find the nearest OTHER player. If the drop point is closer to that
+      // player than to the dragged player's own start, trigger a swap.
+      // This gives a natural "dragged more than halfway" feel.
+      const targetSlot = getSwapTargetSlotAtPoint(t.clientX, t.clientY, d.slot);
+      if (targetSlot !== null && activeField()[targetSlot]) {
+        // Swap positions: dragged player goes to target's original spot, target goes to dragged player's start
+        const origPositions = originalPosRef.current;
+        const draggedStart  = d.startPos;
+        const targetOrig    = origPositions[targetSlot] || activePos()[targetSlot] || { x:50, y:50 };
+
+        // Handle GK flag if either player is GK
+        setActiveField(fp => {
+          const n = [...fp];
+          if (n[d.slot] && n[targetSlot] && (n[d.slot].isGK || n[targetSlot].isGK)) {
+            const gkA = n[d.slot].isGK;
+            n[d.slot]     = { ...n[d.slot],     isGK: n[targetSlot].isGK };
+            n[targetSlot] = { ...n[targetSlot], isGK: gkA };
+          }
+          return n;
+        });
+        setActivePos(ps => ({
+          ...ps,
+          [d.slot]:     { ...targetOrig },
+          [targetSlot]: { ...draggedStart },
+        }));
+        triggerBlink(d.slot, targetSlot);
+        originalPosRef.current = {};
+        setDrag(null);
+        return;
+      }
+
+      // ── Bench drop (substitution) ────────────────────────────────────────────
+      const bIdx = getBenchIdxAt(t.clientX, t.clientY);
+      if (bIdx !== null && activeBench()[bIdx]) {
+        if (activeBench()[bIdx].dns || activeBench()[bIdx].ejected) {
+          // Can't sub with DNS/ejected — snap back
+          setActivePos(ps => ({ ...ps, [d.slot]: d.startPos }));
+          originalPosRef.current = {};
+          setDrag(null);
+          return;
+        }
+        const out = activeField()[d.slot];
+        const inP = activeBench()[bIdx];
+        if (out && inP) {
+          setActivePos(ps => ({ ...ps, [d.slot]: d.startPos }));
+          setActiveField(fp => {
+            const n = [...fp];
+            n[d.slot] = { ...inP, slot:d.slot, isGK:out.isGK, shiftMs:0,
+              totalMs:inP.totalMs||0, benchMs:inP.benchMs||0,
+              gkMs:inP.gkMs||0, h1Ms:inP.h1Ms||0, h2Ms:inP.h2Ms||0 };
+            return n;
+          });
+          setActiveBench(bp => bp.filter(x => x.id !== inP.id).concat([{ ...out, benchMs:out.benchMs||0 }]));
+          if (!subPlanBase) addEvt("🔄 "+(inP.num?"#"+inP.num+" ":"")+inP.name+" IN for "+(out.num?"#"+out.num+" ":"")+out.name);
+          triggerBlink(d.slot);
+        }
+        originalPosRef.current = {};
+        setDrag(null);
+        return;
+      }
+
+      // ── Dropped on empty field — snap back to start or snap to grid ──────────
+      const cur = activePos()[d.slot] || { x:50, y:50 };
+      const clampedX = Math.max(20, Math.min(FIELD_W-20, cur.x));
+      const clampedY = Math.max(20, Math.min(FIELD_H-20, cur.y));
+      const finalPos = snapToGrid
+        ? snapToNearestGridPoint(clampedX, clampedY, lineConfig)
+        : { x: clampedX, y: clampedY };
+      setActivePos(ps => ({ ...ps, [d.slot]: finalPos }));
+      originalPosRef.current = {};
+      setDrag(null);
+    }
+
+    window.addEventListener('pointermove', handleMove, { passive: true });
+    window.addEventListener('pointerup',   handleUp);
+    window.addEventListener('touchmove',   handleMove, { passive: false });
+    window.addEventListener('touchend',    handleUp);
+    return () => {
+      window.removeEventListener('pointermove', handleMove);
+      window.removeEventListener('pointerup',   handleUp);
+      window.removeEventListener('touchmove',   handleMove);
+      window.removeEventListener('touchend',    handleUp);
+    };
+  }, [drag, field, bench, pos, planField, planBench, planPos, subPlanBase, snapToGrid, lineConfig]);
+
+  function onCircleDown(e, slot) {
+    e.stopPropagation();
+    e.preventDefault();
+    const t  = e.touches?.[0] || e;
+    const p  = activePos()[slot] || { x:50, y:50 };
+    const pt = svgPt(t.clientX, t.clientY);
+    const player = activeField()[slot];
+    const d  = {
+      slot,
+      startPos:    { ...p },                          // remember original position
+      startClient: { x: t.clientX, y: t.clientY },
+      ox:   pt ? pt.x - p.x : 0,
+      oy:   pt ? pt.y - p.y : 0,
+      moved: false,
+      name: player?.name || "",
+      num:  player?.num  || "",
+    };
+    dragRef2.current = d;
+    // Freeze a snapshot of all positions at drag-start so swap hit-testing
+    // always hit-tests against stable targets (not the moving dragged circle).
+    originalPosRef.current = { ...activePos() };
+    setDrag(d);
+  }
+
+  // SVG handlers — only bench drag now (field drag is on window)
+  function onSVGMove(e) { if (benchDragRef.current) onBenchPointerMove(e); }
+  function onSVGUp(e)   { if (benchDragRef.current) onBenchPointerUp(e);  }
+
+  // ── Bench drag-to-field substitution ────────────────────────────────────────
+  // Drag a bench player over a field circle, release to sub them in.
+  // Sub drops use a wider target than field-to-field swaps.
+
+  function onBenchCirclePointerDown(e, benchIdx) {
+    if(activeBench()[benchIdx]?.ejected) return;
+    if(activeBench()[benchIdx]?.dns) {
+      modalOpenedAt.current = Date.now();
+      setSelSlot(benchIdx);
+      setModal("dnsAction");
+      return;
+    }
+    e.preventDefault();
+    e.stopPropagation();
+    const touch = e.touches?.[0]||e;
+    benchDragRef.current = { benchIdx, x: touch.clientX, y: touch.clientY,
+      startX: touch.clientX, startY: touch.clientY, hoverSlot: null };
+    setBenchDragState({ benchIdx, x: touch.clientX, y: touch.clientY, hoverSlot: null });
+    try { e.currentTarget.setPointerCapture(e.pointerId); } catch(_){}
+  }
+
+  function onBenchPointerMove(e) {
+    const bd = benchDragRef.current; if(!bd) return;
+    if (e.cancelable) e.preventDefault();
+    const touch = e.touches?.[0]||e;
+    const cx=touch.clientX, cy=touch.clientY;
+    const slot = getSubTargetSlotAtPoint(cx, cy);
+    benchDragRef.current = { ...bd, x: cx, y: cy, hoverSlot: slot };
+    setBenchDragState({ benchIdx: bd.benchIdx, x: cx, y: cy, hoverSlot: slot });
+  }
+
+  function onBenchPointerUp(e) {
+    const bd = benchDragRef.current;
+    benchDragRef.current = null;
+    setBenchDragState(null);
+    if(!bd) return;
+    const touch = e.changedTouches?.[0]||e;
+    // Tap detection: if finger barely moved, open bench action modal
+    const moved = Math.hypot(touch.clientX-(bd.startX||bd.x), touch.clientY-(bd.startY||bd.y));
+    if(moved < 12) {
+      modalOpenedAt.current = Date.now();
+      setSelSlot(bd.benchIdx);
+      setModal(activeBench()[bd.benchIdx]?.dns ? "dnsAction" : "benchAction");
+      return;
+    }
+    // DNS players cannot be subbed in via drag
+    if(activeBench()[bd.benchIdx]?.dns) return;
+    const slot = getSubTargetSlotAtPoint(touch.clientX, touch.clientY);
+    if(slot===null) return; // lifted over empty field — cancel
+    const benchP = activeBench()[bd.benchIdx];
+    const out = activeField()[slot];
+    if(!benchP || !out) return;
+    const outLabel=(out.num?"#"+out.num+" ":"")+out.name;
+    const inLabel=(benchP.num?"#"+benchP.num+" ":"")+benchP.name;
+    setActiveField(fp=>{ const n=[...fp]; n[slot]={...benchP,slot,isGK:out.isGK,shiftMs:0,totalMs:benchP.totalMs||0,benchMs:benchP.benchMs||0,gkMs:benchP.gkMs||0,h1Ms:benchP.h1Ms||0,h2Ms:benchP.h2Ms||0}; return n; });
+    setActiveBench(bp=>bp.filter(x=>x.id!==benchP.id).concat([{...out,benchMs:out.benchMs||0}]));
+    if (!subPlanBase) addEvt("🔄 "+inLabel+" IN for "+outLabel);
+  }
+
+  useEffect(() => {
+    if (!benchDragState) return;
+    function handleBenchMove(e) { onBenchPointerMove(e); }
+    function handleBenchUp(e) { onBenchPointerUp(e); }
+    window.addEventListener('pointermove', handleBenchMove);
+    window.addEventListener('pointerup', handleBenchUp);
+    window.addEventListener('touchmove', handleBenchMove, { passive:false });
+    window.addEventListener('touchend', handleBenchUp);
+    return () => {
+      window.removeEventListener('pointermove', handleBenchMove);
+      window.removeEventListener('pointerup', handleBenchUp);
+      window.removeEventListener('touchmove', handleBenchMove);
+      window.removeEventListener('touchend', handleBenchUp);
+    };
+  }, [benchDragState, field, bench, pos, planField, planBench, planPos, subPlanBase]);
+
+  // ── Guards modal button clicks against touch bleed-through from the player circle tap.
+  // If the modal just opened (within 350ms), ignore the event entirely.
+  function safeClick(fn) {
+    return (e) => {
+      if (Date.now() - modalOpenedAt.current < 350) return;
+      fn(e);
+    };
+  }
+
+  // ── Render ────────────────────────────────────────────────────────────────────
+  if (screen === "setup") return (
+    <Setup
+      teamName={teamName} setTeamName={setTeamName}
+      teamSize={teamSize}
+      roster={roster}
+      newName={newName} setNewName={setNewName}
+      newNum={newNum} setNewNum={setNewNum}
+      addPlayer={addPlayer} removePlayer={removePlayer} changeTeamSize={changeTeamSize}
+      rosters={rosters}
+      saveRoster={saveRoster} loadRoster={loadRoster}
+      deleteRoster={deleteRoster} setDefaultRoster={setDefaultRoster}
+      importRosterCSV={importRosterCSV}
+      saveRosterName={saveRosterName} setSaveRosterName={setSaveRosterName}
+      rosterModal={rosterModal} setRosterModal={setRosterModal}
+      savedGames={savedGames} deleteGame={deleteGame}
+      loadGameSummary={loadGameSummary} exportGameCSV={exportGameCSV}
+      gameListModal={gameListModal} setGameListModal={setGameListModal}
+      gameSetups={gameSetups} gameSetupModal={gameSetupModal} setGameSetupModal={setGameSetupModal}
+      saveGameSetup={saveGameSetup} loadGameSetup={loadGameSetup} deleteGameSetup={deleteGameSetup}
+      lastLoadedSetupName={lastLoadedSetupName}
+      selectedPlayers={selectedPlayers} togglePlayerSelected={togglePlayerSelected}
+      selectAllPlayers={selectAllPlayers} clearAllSelected={clearAllSelected}
+      selectPlayersByTeam={selectPlayersByTeam}
+      h1Formation={h1Formation} h2Formation={h2Formation}
+      openFormation={openFormation}
+      gameInProgress={events.length>0 && !gameEnded}
+      onReturnToGame={()=>setScreen("game")}
+      opponent={opponent} setOpponent={setOpponent}
+      gameDate={gameDate} setGameDate={setGameDate}
+      competition={competition} setCompetition={setCompetition}
+      settingsModal={settingsModal} setSettingsModal={setSettingsModal}
+      showJerseyNum={showJerseyNum} setShowJerseyNum={setShowJerseyNum}
+      showPlayerTeam={showPlayerTeam} setShowPlayerTeam={setShowPlayerTeam}
+      showHalfCols={showHalfCols} setShowHalfCols={setShowHalfCols}
+      statsModal={statsModal} setStatsModal={setStatsModal}
+      playerStats={playerStats} setPlayerStats={setPlayerStats}
+      snapToGrid={snapToGrid} setSnapToGrid={setSnapToGrid}
+      showGrid={showGrid} setShowGrid={setShowGrid}
+      subPlanMode={subPlanMode} setSubPlanMode={setSubPlanMode}
+    />
+  );
+
+  // ── FORMATION PLANNER SCREEN ─────────────────────────────────────────────────
+  if (screen === "game" && formationScreen !== null) {
+    const which = formationScreen;
+    const otherWhich = which==="h1"?"h2":"h1";
+    const otherLabel = which==="h1"?"2nd Half Formation":"1st Half Formation";
+    return (
+      <FormationPlanner
+        which={which}
+        field={field} bench={bench} pos={pos} goals={{}}
+        setField={setField} setBench={setBench} setPos={setPos}
+        teamName={teamName} teamSize={teamSize}
+        showJerseyNum={showJerseyNum}
+        snapToGrid={snapToGrid} showGrid={showGrid}
+        lineConfig={lineConfig} setLineConfig={setLineConfig}
+        which={which}
+        onSave={()=>{ saveFormation(which); }}
+        onLaunch={()=>launchGame(which)}
+        onOther={()=>{ saveFormation(which); openFormation(otherWhich); }}
+        onMenu={()=>{ saveFormation(which); setFormationScreen(null); setScreen("setup"); }}
+        otherLabel={otherLabel}
+        isH2={which==="h2"}
+        gameInProgress={events.length>0 && !gameEnded}
+        half={half}
+      />
+    );
+  }
+
+  if (screen === "summary") {
+    // If viewing a loaded past game, use its data instead of live state
+    const sg = viewingGame;
+    const sumField   = sg ? (sg.players||[]).filter(p=>p.status==="field") : field;
+    const sumBench   = sg ? (sg.players||[]).filter(p=>p.status!=="field") : bench;
+    const sumEvents  = sg ? (sg.events||[]) : events;
+    const sumScore   = sg ? sg.score : score;
+    const sumGoals   = sg ? (sg.goals||{}) : goals;
+    const sumGameMs  = sg ? (sg.gameMs||0) : gameMs;
+    const sumTeam    = sg ? sg.teamName : teamName;
+    const sumOpp     = sg ? sg.opponent : opponent;
+    const sumDate    = sg ? sg.date : gameDate;
+    const sumComp    = sg ? sg.competition : competition;
+    return (
+      <Summary
+        field={sumField} bench={sumBench} events={sumEvents}
+        score={sumScore} goals={sumGoals} gameMs={sumGameMs}
+        teamName={sumTeam} opponent={sumOpp} gameDate={sumDate} competition={sumComp}
+        teamSize={teamSize}
+        statsSaved={!!sg || gameEnded}
+        onSaveStats={saveGameToStats}
+        onBack={() => {
+          setViewingGame(null);
+          setScreen("setup");
+          if (!sg) { setField([]); setBench([]); setEvents([]); setRunning(false); setGameEnded(false); }
+        }}
+      />
+    );
+  }
+
+  // ── GAME SCREEN ───────────────────────────────────────────────────────────────
+  const planning = !!subPlanBase;
+  const shownField = planning ? (planField || []) : field;
+  const shownBench = planning ? (planBench || []) : bench;
+  const shownPos = planning ? (planPos || {}) : pos;
+  const subPlanSummary = planning ? buildSubPlanSummary() : { ops: [], hasChanges: false };
+  const selP = selSlot !== null ? shownField[selSlot] : null;
+
+  return (
+    <div style={{...S.root, isolation:"isolate", background:planning?"#081b33":S.root.background}}>
+      <div style={{background:"#0d1f3c",borderBottom:"1px solid #1e3a5f",flexShrink:0,position:"sticky",top:0,zIndex:10}}>
+        {/* Row 1: team name / half / buttons */}
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"5px 10px"}}>
+          <div style={{display:"flex",alignItems:"center",gap:6}}>
+            <span style={{fontSize:11,color:"#7aa0cc",fontWeight:700}}>{teamName}</span>
+            <span style={{fontSize:9,color:"#4a6a8a",background:"#071120",padding:"2px 6px",borderRadius:9}}>H{half}</span>
+            {planning && <span style={{fontSize:9,color:"#fef3c7",background:"#92400e",padding:"2px 6px",borderRadius:9,fontWeight:800}}>PLAN</span>}
+          </div>
+          <div style={{display:"flex",gap:4}}>
+            <button
+              onClick={()=>{ if(planning){reviewSubPlan(); return;} if(running) setRunning(false); if(events.length>0&&!gameEnded){ const snap={field:field.map(p=>({...p})),bench:bench.map(p=>({...p})),pos:{...pos}}; if(half===1)setH1Formation(snap); else setH2Formation(snap); setModal("saveStats"); } else { setScreen("setup"); } }}
+              style={B.sm("#1e3a5f","#7aa0cc")}
+            >Menu</button>
+          </div>
+        </div>
+        {/* Row 2: clock | team score : opp score +Opp | team names */}
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"3px 10px 6px"}}>
+          {/* Clock on the left */}
+          <span style={{fontSize:22,fontWeight:800,letterSpacing:1,color:running?"#4ade80":"#f59e0b",fontVariantNumeric:"tabular-nums",minWidth:58}}>{fmt(gameMs)}</span>
+          {/* Score in centre */}
+          <div style={{display:"flex",alignItems:"center",gap:6}}>
+            <span style={{fontSize:11,color:"#7aa0cc"}}>{teamName}</span>
+            <span style={{fontSize:28,fontWeight:800,lineHeight:1}}>{score.us}</span>
+            <span style={{fontSize:16,color:"#4a6a8a"}}>:</span>
+            <span style={{fontSize:28,fontWeight:800,lineHeight:1}}>{score.them}</span>
+            <span style={{fontSize:11,color:"#7aa0cc"}}>{opponent||"Opp"}</span>
+            <button onClick={planning?undefined:oppGoal} disabled={planning} style={B.sm(planning?"#301313":"#7f1d1d",planning?"#7f1d1d":"#fca5a5")}>+</button>
+          </div>
+          {/* Spacer to keep score centred */}
+          <span style={{minWidth:58}}/>
+        </div>
+      </div>
+
+      {/* Field / Table toggle */}
+      {gameView==="field" ? (
+      <div style={{flex:1,display:"flex",justifyContent:"center",padding:"2px 4px 0",position:"relative",zIndex:0,minHeight:0,overflow:"hidden"}}>
+        <svg ref={svgRef} viewBox={`0 0 ${FIELD_W} ${FIELD_H}`}
+          style={{width:"100%",maxWidth:440,height:"100%",maxHeight:"100%",touchAction:"pan-y",cursor:drag?"grabbing":"default"}}
+          onPointerMove={onSVGMove}
+          onPointerUp={onSVGUp}
+          onPointerCancel={e=>{benchDragRef.current=null; setBenchDragState(null);}}
+        >
+          {/* Pitch */}
+          <rect width={FIELD_W} height={FIELD_H} fill={planning?"#1d4ed8":"#1a4a2a"} rx="8"/>
+          <rect x={8} y={8} width={FIELD_W-16} height={FIELD_H-16} fill="none" stroke={planning?"#fbbf24":"#2d7a45"} strokeWidth={planning?"2.5":"1.5"} rx="5"/>
+          <line x1={8} y1={FIELD_H/2} x2={FIELD_W-8} y2={FIELD_H/2} stroke={planning?"#93c5fd":"#2d7a45"} strokeWidth="1"/>
+          <circle cx={FIELD_W/2} cy={FIELD_H/2} r={36} fill="none" stroke={planning?"#93c5fd":"#2d7a45"} strokeWidth="1"/>
+          <rect x={FIELD_W/2-55} y={8} width={110} height={73} fill="none" stroke={planning?"#93c5fd":"#2d7a45"} strokeWidth="1"/>
+          <rect x={FIELD_W/2-55} y={FIELD_H-81} width={110} height={73} fill="none" stroke={planning?"#93c5fd":"#2d7a45"} strokeWidth="1"/>
+          <rect x={FIELD_W/2-25} y={1} width={50} height={10} fill="none" stroke={planning?"#fbbf24":"#3da05a"} strokeWidth="1.5"/>
+          <rect x={FIELD_W/2-25} y={FIELD_H-11} width={50} height={10} fill="none" stroke={planning?"#fbbf24":"#3da05a"} strokeWidth="1.5"/>
+
+          {/* Grid points overlay */}
+          {showGrid && gridPoints(lineConfig).map((pt, i) => (
+            <g key={"gp"+i}>
+              <circle cx={pt.x} cy={pt.y} r={6} fill="none" stroke="rgba(255,255,255,0.25)" strokeWidth="1.5"/>
+              <circle cx={pt.x} cy={pt.y} r={1.5} fill="rgba(255,255,255,0.35)"/>
+            </g>
+          ))}
+
+          {/* Player circles — dragged slot rendered last so it's on top */}
+          {shownField.map((player, slot) => {
+            if (drag?.moved && slot === drag.slot) return null; // rendered last
+            const p  = shownPos[slot] || {x:50, y:50};
+            const g  = goals[player.id] || 0;
+            const dn = player.num || String(slot+1);
+            const isSel = selSlot === slot;
+            return (
+              <g key={player.id} onPointerDown={e=>onCircleDown(e,slot)} style={{cursor:"grab",touchAction:"none"}}>
+                {/* Invisible hit area */}
+                <circle cx={p.x} cy={p.y} r={40} fill="transparent" stroke="none"/>
+                {/* Bench drag hover highlight */}
+                {benchDragState?.hoverSlot===slot && (
+                  <circle cx={p.x} cy={p.y} r={34} fill="none" stroke="#4ade80" strokeWidth="3" strokeDasharray="6 3"/>
+                )}
+                {/* Field-to-field swap hover highlight */}
+                {fieldHoverSlot===slot && drag?.moved && (
+                  <circle cx={p.x} cy={p.y} r={34} fill="none" stroke="#f59e0b" strokeWidth="3" strokeDasharray="6 3"/>
+                )}
+                {/* Sub confirmation blink ring */}
+                {(blinkSlot===slot || blinkSlot2===slot) && (
+                  <circle cx={p.x} cy={p.y} r={34} fill="none" stroke="#4ade80" strokeWidth="4"
+                    style={{animation:"subBlink 0.4s ease-in-out 2"}}/>
+                )}
+                {/* GK dashed ring */}
+                {player.isGK && <circle cx={p.x} cy={p.y} r={35} fill="none" stroke="#fbbf24" strokeWidth="3" strokeDasharray="6 3"/>}
+                {/* Main circle */}
+                <circle cx={p.x} cy={p.y} r={29}
+                  fill={benchDragState?.hoverSlot===slot?"#14532d":isSel?"#1e40af":planning?"#0f172a":"#2563eb"}
+                  stroke={benchDragState?.hoverSlot===slot?"#4ade80":isSel?"#93c5fd":planning?"#fbbf24":"#60a5fa"}
+                  strokeWidth={benchDragState?.hoverSlot===slot?3:isSel?3:2}
+                />
+                {/* Shift time — top, larger */}
+                <text x={p.x} y={p.y-7} textAnchor="middle" dominantBaseline="middle" fontSize="14" fill="#fff" fontWeight="700">{fmtS(player.shiftMs)}</text>
+                {/* Total time played — bottom, slightly smaller */}
+                <text x={p.x} y={p.y+11} textAnchor="middle" dominantBaseline="middle" fontSize="11" fill="#93c5fd">{fmtS(player.totalMs)}</text>
+                {/* Goal badge */}
+                {g>0 && <>
+                  <circle cx={p.x+23} cy={p.y-23} r={9} fill="#f59e0b"/>
+                  <text x={p.x+23} y={p.y-23} textAnchor="middle" dominantBaseline="middle" fontSize="9" fill="#fff" fontWeight="700">{g}⚽</text>
+                </>}
+                {/* Name below circle — with optional jersey # */}
+                <text x={p.x} y={p.y+44} textAnchor="middle" fontSize="11" fill="#e2e8f0" fontWeight="500">
+                  {(()=>{const nm=player.name.length>11?player.name.slice(0,10)+"…":player.name; return showJerseyNum&&player.num?nm+" #"+player.num:nm;})()}
+                </text>
+              </g>
+            );
+          })}
+        </svg>
+      </div>
+      ) : (
+      /* ── TABLE VIEW ─────────────────────────────────────────────────────── */
+      <div style={{flex:1,overflowY:"auto",background:"#071120",padding:"8px 10px"}}>
+        <div style={{fontSize:10,color:"#4a6a8a",fontWeight:700,letterSpacing:1,marginBottom:8}}>
+          PLAYING TIME — sorted least → most played{half===1?" (half time planning)":" (2nd half)"}
+        </div>
+        {(()=>{
+          // Build sortable column defs
+          const cols = [
+            {key:"shift", label:"Shift", color:"#fff"},
+            {key:"total", label:"Total", color:"#60a5fa"},
+            {key:"gk",    label:"GK",   color:"#fbbf24"},
+            ...(showHalfCols?[{key:"h1",label:"H1",color:"#a78bfa"},{key:"h2",label:"H2",color:"#34d399"}]:[]),
+            {key:"goals", label:"⚽",   color:"#f59e0b"},
+          ];
+          const SortHdr = ({col})=>{
+            const active=tableSortCol===col.key;
+            const arrow=active?(tableSortDir==="asc"?" ↑":" ↓"):"";
+            return (
+              <span
+                onClick={()=>{
+                  if(tableSortCol===col.key) setTableSortDir(d=>d==="asc"?"desc":"asc");
+                  else{setTableSortCol(col.key);setTableSortDir("asc");}
+                }}
+                style={{textAlign:"right",color:active?col.color:"#4a6a8a",cursor:"pointer",userSelect:"none",fontWeight:active?800:700}}
+              >{col.label}{arrow}</span>
+            );
+          };
+          const gridCols = "1fr"+" 46px".repeat(cols.length);
+          // Sort rows: bench always after field, ejected always last, then by chosen col
+          const rows = [
+            ...field.map((p,i)=>({...p,_status:"field",_slot:i})),
+            ...bench.filter(p=>!p.ejected).map(p=>({...p,_status:"bench"})),
+            ...bench.filter(p=>p.ejected).map(p=>({...p,_status:"ejected"})),
+          ].sort((a,b)=>{
+            if(a._status==="ejected"&&b._status!=="ejected") return 1;
+            if(b._status==="ejected"&&a._status!=="ejected") return -1;
+            if(a._status==="bench"&&b._status==="field") return 1;
+            if(b._status==="bench"&&a._status==="field") return -1;
+            const dir=tableSortDir==="asc"?1:-1;
+            const val=(p,k)=>{
+              if(k==="shift") return p._status==="bench"?(p.benchMs||0):(p.shiftMs||0);
+              if(k==="total") return p.totalMs||0;
+              if(k==="gk")    return p.gkMs||0;
+              if(k==="h1")    return p.h1Ms||0;
+              if(k==="h2")    return p.h2Ms||0;
+              if(k==="goals") return goals[p.id]||0;
+              return 0;
+            };
+            return dir*(val(a,tableSortCol)-val(b,tableSortCol));
+          });
+          return (<>
+        {/* Sortable header */}
+        <div style={{display:"grid",gridTemplateColumns:gridCols,gap:3,padding:"6px 10px",background:"#1e3a5f",borderRadius:"8px 8px 0 0",fontSize:10,fontWeight:700,letterSpacing:0.3,marginBottom:1}}>
+          <span style={{color:"#4a6a8a"}}>Player</span>
+          {cols.map(c=><SortHdr key={c.key} col={c}/>)}
+        </div>
+        {rows.map((p,i,arr)=>{
+          const g=goals[p.id]||0;
+          const isBench=p._status==="bench";
+          const isEjected=p._status==="ejected";
+          const isLast=i===arr.length-1;
+          const rowBg=isEjected?"#1a0505":isBench?"#091422":"#0d1f3c";
+          const nameLabel=(()=>{const nm=p.name.length>13?p.name.slice(0,12)+"…":p.name; return showJerseyNum&&p.num?nm+" #"+p.num:nm;})();
+          const shiftLabel = isBench ? fmtS(p.benchMs||0) : fmtS(p.shiftMs||0);
+          const shiftSub   = isBench ? "bench" : "shift";
+          const gkTime     = p.gkMs||0;
+          return (
+            <div key={p.id}
+              onClick={isEjected?undefined:()=>{
+                modalOpenedAt.current=Date.now();
+                if(p._status==="field"){setSelSlot(p._slot);setModal("player");}
+                else{setSubSlot(null);setSelSlot(null);setSubSlot(p._slot!==undefined?p._slot:null);
+                  // For bench players open a special bench-action modal
+                  setModal("benchAction");setSelSlot(bench.findIndex(b=>b.id===p.id));
+                }
+              }}
+              style={{display:"grid",gridTemplateColumns:gridCols,gap:3,padding:"9px 10px",background:rowBg,borderBottom:"1px solid #071120",borderRadius:isLast?"0 0 8px 8px":undefined,alignItems:"center",cursor:isEjected?"default":"pointer",WebkitTapHighlightColor:"transparent"}}>
+              <div style={{overflow:"hidden"}}>
+                <div style={{display:"flex",alignItems:"center",gap:4,marginBottom:2}}>
+                  {p.isGK&&<span style={{fontSize:9,color:"#fbbf24",fontWeight:700,background:"#2d1f00",padding:"1px 5px",borderRadius:4}}>GK</span>}
+                  {isBench&&!isEjected&&<span style={{fontSize:9,color:"#60a5fa",fontWeight:700,background:"#0a1e3a",padding:"1px 5px",borderRadius:4}}>BENCH</span>}
+                  {isEjected&&<span style={{fontSize:9,color:"#fca5a5",fontWeight:700,background:"#3b0a0a",padding:"1px 5px",borderRadius:4}}>🟥 OUT</span>}
+                  {!isEjected&&<span style={{fontSize:9,color:"#4a6a8a",marginLeft:"auto"}}>›</span>}
+                </div>
+                <div style={{fontSize:14,color:isEjected?"#4a6a8a":isBench?"#93c5fd":"#e2e8f0",fontWeight:isBench?400:600,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{nameLabel}</div>
+              </div>
+              <div style={{textAlign:"right"}}>
+                <div style={{fontSize:14,color:isBench?"#f87171":"#fff",fontWeight:700,fontVariantNumeric:"tabular-nums"}}>{shiftLabel}</div>
+                <div style={{fontSize:9,color:"#4a6a8a"}}>{shiftSub}</div>
+              </div>
+              <div style={{textAlign:"right"}}>
+                <div style={{fontSize:14,color:"#60a5fa",fontWeight:700,fontVariantNumeric:"tabular-nums"}}>{fmtS(p.totalMs||0)}</div>
+                <div style={{fontSize:9,color:"#4a6a8a"}}>total</div>
+              </div>
+              <div style={{textAlign:"right"}}>
+                <div style={{fontSize:13,color:gkTime>0?"#fbbf24":"#1e3a5f",fontWeight:700,fontVariantNumeric:"tabular-nums"}}>{gkTime>0?fmtS(gkTime):"—"}</div>
+                <div style={{fontSize:9,color:"#4a6a8a"}}>gk</div>
+              </div>
+              {showHalfCols&&<div style={{textAlign:"right"}}>
+                <div style={{fontSize:12,color:"#a78bfa",fontWeight:700,fontVariantNumeric:"tabular-nums"}}>{fmtS(p.h1Ms||0)}</div>
+                <div style={{fontSize:9,color:"#4a6a8a"}}>h1</div>
+              </div>}
+              {showHalfCols&&<div style={{textAlign:"right"}}>
+                <div style={{fontSize:12,color:"#34d399",fontWeight:700,fontVariantNumeric:"tabular-nums"}}>{fmtS(p.h2Ms||0)}</div>
+                <div style={{fontSize:9,color:"#4a6a8a"}}>h2</div>
+              </div>}
+              <div style={{textAlign:"right",fontSize:15,color:g>0?"#f59e0b":"#1e3a5f",fontWeight:700}}>{g||"—"}</div>
+            </div>
+          );
+        })}
+        <div style={{fontSize:10,color:"#4a6a8a",marginTop:8,textAlign:"center"}}>Tap 📋 Table again or ⚽ Field to return to the pitch</div>
+          </>);
+        })()}
+      </div>
+      )}
+
+      {/* Timer controls */}
+      <div style={{padding:"4px 8px",display:"flex",alignItems:"center",justifyContent:"space-between",gap:8,background:"#0d1f3c",borderTop:"1px solid #1e3a5f",position:"relative",zIndex:drag?.moved?0:2,flexShrink:0,overflow:"hidden"}}>
+        {planning ? (<>
+          <button onClick={reviewSubPlan} style={B.ctrlCompact("#f59e0b","#fff7ed",true)}>Exit</button>
+          <button onClick={cancelSubPlanning} style={B.ctrlCompact("#1e3a5f","#93c5fd")}>Cancel</button>
+        </>) : (<>
+          {!running && half===1 && events.length===0 && <button onClick={startHalf} style={B.ctrlCompact("#15803d","#bbf7d0",true)}>Start</button>}
+          {running  && half===1 && <button onClick={()=>setRunning(false)} style={B.ctrlCompact("#854d0e","#fde68a")}>Pause</button>}
+          {!running && half===1 && gameMs>0 && <button onClick={()=>setRunning(true)} style={B.ctrlCompact("#1d4ed8","#bfdbfe")}>Resume</button>}
+          {running  && half===1 && <button onClick={doHalfTime} style={B.ctrlCompact("#7c3aed","#ddd6fe")}>Half</button>}
+          {!running && half===2 && <button onClick={startHalf} style={B.ctrlCompact("#15803d","#bbf7d0",true)}>Start</button>}
+          {running  && half===2 && <button onClick={()=>setRunning(false)} style={B.ctrlCompact("#854d0e","#fde68a")}>Pause</button>}
+          {!running && half===2 && gameMs>0 && <button onClick={()=>setRunning(true)} style={B.ctrlCompact("#1d4ed8","#bfdbfe")}>Resume</button>}
+          {half===2 && (running || gameMs>0) && <button onClick={endGame} style={B.ctrlCompact("#7f1d1d","#fca5a5")}>Full</button>}
+          {(running || gameMs>0) && <button onClick={enterSubPlanning} style={B.ctrlCompact("#0e7490","#cffafe",true)}>Plan</button>}
+        </>)}
+        <button onClick={planning?undefined:()=>{modalOpenedAt.current=Date.now();setModal("log");}} disabled={planning} style={B.ctrlCompact(planning?"#0b1628":"#1e3a5f",planning?"#2f4a68":"#7aa0cc")}>Log</button>
+        <button onClick={planning?undefined:()=>setGameView(v=>v==="field"?"table":"field")} disabled={planning} style={B.ctrlCompact(planning?"#0b1628":gameView==="table"?"#1d4ed8":"#1e3a5f",planning?"#2f4a68":gameView==="table"?"#bfdbfe":"#7aa0cc")}>{gameView==="table"?"Field":"Table"}</button>
+      </div>
+
+      {/* ── Bench section ────────────────────────────────────────────────── */}
+      <div ref={benchContRef} style={{padding:"5px 10px 8px",background:"#050e1e",borderTop:"1px solid #0d1f3c",position:"relative",zIndex:drag?.moved?0:1,flexShrink:0}}
+        onPointerMove={benchDragRef.current ? onBenchPointerMove : undefined}
+        onPointerUp={benchDragRef.current ? onBenchPointerUp : undefined}
+        onPointerCancel={onBenchPointerUp}
+      >
+        <div style={{fontSize:9,color:"#4a6a8a",marginBottom:7,fontWeight:700,letterSpacing:1}}>
+          {planning ? "PLANNED " : ""}BENCH ({shownBench.filter(p=>!p.ejected).length}) — drag to field to sub · red=bench time, blue=played
+        </div>
+        <div style={{display:"flex",gap:4,flexWrap:"wrap",alignItems:"flex-start"}}>
+          {[...shownBench].sort((a,b)=>{
+            if(a.ejected&&!b.ejected) return 1;
+            if(!a.ejected&&b.ejected) return -1;
+            if(a.dns&&!b.dns) return -1; // late players leftmost
+            if(!a.dns&&b.dns) return 1;
+            const bd=(a.benchMs||0)-(b.benchMs||0);
+            return bd!==0?bd:(b.totalMs||0)-(a.totalMs||0);
+          }).map((p,sortedIdx) => {
+            const origIdx = shownBench.findIndex(x=>x.id===p.id);
+            const g = goals[p.id]||0;
+            const circleFill   = p.ejected ? "#3b0a0a" : p.dns ? "#1a1a0a" : "#1e3a5f";
+            const circleStroke = p.ejected ? "#991b1b" : p.dns ? "#a16207" : "#2d5a8f";
+            const isDragging   = benchDragState?.benchIdx===origIdx;
+            const nm = p.name.length>11?p.name.slice(0,10)+"…":p.name;
+            const nameLabel = showJerseyNum&&p.num ? nm+" #"+p.num : nm;
+            return (
+              <div key={p.id}
+                data-benchidx={origIdx}
+                onPointerDown={p.ejected?undefined:e=>onBenchCirclePointerDown(e,origIdx)}
+                style={{display:"flex",flexDirection:"column",alignItems:"center",gap:3,opacity:isDragging?0.35:1,cursor:p.ejected?"default":"grab",touchAction:"none"}}
+              >
+                <div style={{position:"relative",width:58,height:58}}>
+                  <svg width="58" height="58" viewBox="0 0 58 58">
+                    {fieldDragOver===origIdx && !p.ejected && !p.dns && <circle cx={29} cy={29} r={28} fill="none" stroke="#4ade80" strokeWidth="2.5" strokeDasharray="5 3"/>}
+                    <circle cx={29} cy={29} r={25} fill={fieldDragOver===origIdx&&!p.dns?"#14532d":circleFill} stroke={isDragging?"#60a5fa":fieldDragOver===origIdx&&!p.dns?"#4ade80":circleStroke} strokeWidth={isDragging||fieldDragOver===origIdx&&!p.dns?3:2}/>
+                    {p.ejected ? (
+                      <text x={29} y={31} textAnchor="middle" dominantBaseline="middle" fontSize="16">🟥</text>
+                    ) : p.dns ? (<>
+                      <text x={29} y={24} textAnchor="middle" dominantBaseline="middle" fontSize="10" fill="#a16207" fontWeight="700">{p.num||"?"}</text>
+                      <text x={29} y={38} textAnchor="middle" dominantBaseline="middle" fontSize="9" fill="#60a5fa">{fmtS(p.totalMs)}</text>
+                    </>) : (<>
+                      <text x={29} y={24} textAnchor="middle" dominantBaseline="middle" fontSize="12" fill="#f87171" fontWeight="700">{fmtS(p.benchMs)}</text>
+                      <text x={29} y={38} textAnchor="middle" dominantBaseline="middle" fontSize="9" fill="#60a5fa">{fmtS(p.totalMs)}</text>
+                    </>)}
+                  </svg>
+                  {g>0 && <div style={{position:"absolute",top:-3,right:-3,background:"#f59e0b",borderRadius:"50%",width:16,height:16,display:"flex",alignItems:"center",justifyContent:"center",fontSize:9,fontWeight:700,color:"#fff"}}>{g}</div>}
+                </div>
+                <span style={{fontSize:9,color:p.ejected?"#fca5a5":"#7aa0cc",maxWidth:58,textAlign:"center",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{nameLabel}</span>
+              </div>
+            );
+          })}
+          {shownBench.filter(p=>!p.ejected).length===0 && <span style={{fontSize:11,color:"#4a6a8a"}}>No subs available</span>}
+        </div>
+      </div>
+
+      {/* Field drag portal ghost — fixed position, always above everything */}
+      {drag?.moved && shownField[drag.slot] && dragRef2.current?.clientX !== undefined && (()=>{
+        const d = dragRef2.current;
+        const player = shownField[d.slot];
+        if (!player) return null;
+        const nm = player.name.length>8?player.name.slice(0,7)+"…":player.name;
+        const cx = d.clientX, cy = d.clientY;
+        return (
+          <div style={{position:"fixed",left:cx-32,top:cy-36,width:64,height:64,pointerEvents:"none",zIndex:9999}}>
+            <svg width="64" height="64" viewBox="0 0 64 64">
+              {player.isGK&&<circle cx={32} cy={32} r={31} fill="none" stroke="#fbbf24" strokeWidth="2.5" strokeDasharray="5 3"/>}
+              <circle cx={32} cy={32} r={30} fill={planning?"#0f172a":"#1e40af"} stroke={planning?"#fbbf24":"#93c5fd"} strokeWidth="3"/>
+              <text x={32} y={26} textAnchor="middle" dominantBaseline="middle" fontSize="13" fill="#fff" fontWeight="700">{fmtS(player.shiftMs)}</text>
+              <text x={32} y={40} textAnchor="middle" dominantBaseline="middle" fontSize="10" fill="#93c5fd">{fmtS(player.totalMs)}</text>
+            </svg>
+            <div style={{position:"absolute",bottom:-14,left:"50%",transform:"translateX(-50%)",fontSize:9,color:"#e2e8f0",whiteSpace:"nowrap",fontWeight:500}}>{nm}</div>
+          </div>
+        );
+      })()}
+
+      {/* Bench drag ghost — floating circle following the finger */}
+      {benchDragState && shownBench[benchDragState.benchIdx] && (()=>{
+        const bp=shownBench[benchDragState.benchIdx];
+        const nm=bp.name.length>8?bp.name.slice(0,7)+"…":bp.name;
+        return (
+          <div style={{position:"fixed",left:benchDragState.x-32,top:benchDragState.y-52,width:64,height:64,pointerEvents:"none",zIndex:200,opacity:0.92}}>
+            <svg width="64" height="64" viewBox="0 0 64 64">
+              <circle cx={32} cy={32} r={28} fill="#1d4ed8" stroke="#93c5fd" strokeWidth="2.5"/>
+              <text x={32} y={28} textAnchor="middle" dominantBaseline="middle" fontSize="13" fill="#fff" fontWeight="700">{fmtS(bp.benchMs||0)}</text>
+              <text x={32} y={43} textAnchor="middle" dominantBaseline="middle" fontSize="10" fill="#93c5fd">{nm}</text>
+            </svg>
+          </div>
+        );
+      })()}
+
+      {/* ── Modals ── */}
+
+      {/* Player action */}
+      {modal==="player" && selP && (
+        <div style={S.overlay} onClick={safeClick(()=>{setModal(null);setSelSlot(null);})}>
+          <div style={S.card} onClick={e=>e.stopPropagation()}>
+            <div style={{fontWeight:800,fontSize:17,color:"#fff"}}>{selP.num?`#${selP.num} `:""}{selP.name}</div>
+            <div style={{fontSize:11,color:"#7aa0cc",marginBottom:14}}>
+              Total: {fmtS(selP.totalMs)} · Shift: {fmtS(selP.shiftMs)}
+              {selP.isGK && <span style={{marginLeft:8,color:"#fbbf24"}}>★ GK</span>}
+              {(goals[selP.id]||0)>0 && <span style={{marginLeft:8,color:"#f59e0b"}}>⚽×{goals[selP.id]}</span>}
+            </div>
+            <div style={{display:"flex",flexDirection:"column",gap:8}}>
+              <button onClick={safeClick(()=>{modalOpenedAt.current=Date.now();setSubSlot(selSlot);setModal("sub");})} style={B.act("#1d4ed8","#93c5fd")}>{planning?"Plan Substitute Out":"🔄 Substitute Out"}</button>
+              {!planning && <button onClick={safeClick(()=>goalForSlot(selSlot))} style={B.act("#15803d","#86efac")}>⚽ Goal Scored</button>}
+              {!planning && <button onClick={safeClick(()=>{modalOpenedAt.current=Date.now();setCardSlot(selSlot);setModal("card");})} style={B.act("#b45309","#fde68a")}>🟨 Card</button>}
+              {!planning && <button onClick={safeClick(()=>assignGK(selSlot))} style={B.act("#7c3aed","#c4b5fd")}>{selP.isGK?"★ Remove GK marker":"★ Assign as Goalkeeper"}</button>}
+            </div>
+            <button onClick={safeClick(()=>{setModal(null);setSelSlot(null);})} style={B.cancel()}>Cancel</button>
+          </div>
+        </div>
+      )}
+
+      {/* Sub picker */}
+      {modal==="sub" && subSlot!==null && (
+        <div style={S.overlay} onClick={safeClick(()=>{setModal(null);setSubSlot(null);})}>
+          <div style={{...S.card,maxHeight:"80vh",overflowY:"auto"}} onClick={e=>e.stopPropagation()}>
+            <div style={{fontWeight:700,fontSize:14,color:"#fff",marginBottom:4}}>
+              Sub in for {shownField[subSlot]?.num?`#${shownField[subSlot].num} `:""}{shownField[subSlot]?.name}
+            </div>
+            <div style={{fontSize:11,color:"#7aa0cc",marginBottom:12}}>Select from bench:</div>
+            {shownBench.filter(p=>!p.ejected).length===0 && <div style={{color:"#4a6a8a",fontSize:13}}>{shownBench.length>0?"All bench players have been ejected":"No bench players"}</div>}
+            <div style={{display:"flex",flexDirection:"column",gap:7}}>
+              {shownBench.filter(p=>!p.ejected&&!p.dns).map(p=>(
+                <button key={p.id} onClick={safeClick(()=>doSub(p))} style={{...B.act("#15803d","#86efac"),display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                  <span>{p.num?`#${p.num} `:""}{p.name}</span>
+                  <span style={{fontSize:11,color:"#86efac",marginLeft:8}}>▶{fmtS(p.totalMs)} 🪑{fmtS(p.benchMs)}</span>
+                </button>
+              ))}
+            </div>
+            <button onClick={safeClick(()=>{setModal(null);setSubSlot(null);})} style={B.cancel()}>Cancel</button>
+          </div>
+        </div>
+      )}
+
+      {/* Card */}
+      {modal==="card" && cardSlot!==null && (
+        <div style={S.overlay} onClick={safeClick(()=>{setModal(null);setCardSlot(null);})}>
+          <div style={S.card} onClick={e=>e.stopPropagation()}>
+            <div style={{fontWeight:700,fontSize:15,marginBottom:14,color:"#fff"}}>Card — {field[cardSlot]?.name}</div>
+            <div style={{display:"flex",gap:10}}>
+              <button onClick={safeClick(()=>giveCard(cardSlot,"yellow"))} style={{...B.act("#b45309","#fde68a"),flex:1,textAlign:"center"}}>🟨 Yellow</button>
+              <button onClick={safeClick(()=>giveCard(cardSlot,"red"))} style={{...B.act("#991b1b","#fca5a5"),flex:1,textAlign:"center"}}>🟥 Red</button>
+            </div>
+            <button onClick={safeClick(()=>{setModal(null);setCardSlot(null);})} style={B.cancel()}>Cancel</button>
+          </div>
+        </div>
+      )}
+
+      {/* Sub plan confirm modal */}
+      {/* Bench player action (from table view tap) */}
+      {modal==="dnsAction" && selSlot!==null && shownBench[selSlot] && (()=>{
+        const bp = shownBench[selSlot];
+        return (
+          <div style={S.overlay} onClick={safeClick(()=>{setModal(null);setSelSlot(null);})}>
+            <div style={S.card} onClick={e=>e.stopPropagation()}>
+              <div style={{fontWeight:800,fontSize:17,color:"#fff"}}>{bp.num?`#${bp.num} `:""}{bp.name}</div>
+              <div style={{fontSize:12,color:"#f59e0b",marginBottom:6}}>🚫 Did Not Show</div>
+              <div style={{fontSize:11,color:"#4a6a8a",marginBottom:14}}>Mark this player as arrived to allow substitutions.</div>
+              <button onClick={safeClick(()=>{
+                setActiveBench(bx=>bx.map(b=>b.id===bp.id?{...b,dns:false}:b));
+                if (!planning) addEvt(`✅ Arrived: ${bp.num?"#"+bp.num+" ":""}${bp.name} — now available`);
+                setModal(null);setSelSlot(null);
+              })} style={{...B.act("#15803d","#86efac"),marginBottom:8,textAlign:"center"}}>✅ Mark as Arrived</button>
+              <button onClick={safeClick(()=>{setModal(null);setSelSlot(null);})} style={B.cancel()}>Cancel</button>
+            </div>
+          </div>
+        );
+      })()}
+
+      {modal==="benchAction" && selSlot!==null && shownBench[selSlot] && (()=>{
+        const bp = shownBench[selSlot];
+        return (
+          <div style={S.overlay} onClick={safeClick(()=>{setModal(null);setSelSlot(null);})}>
+            <div style={S.card} onClick={e=>e.stopPropagation()}>
+              <div style={{fontWeight:800,fontSize:17,color:"#fff"}}>{bp.num?`#${bp.num} `:""}{bp.name}</div>
+              <div style={{fontSize:11,color:"#7aa0cc",marginBottom:14}}>
+                Bench: {fmtS(bp.benchMs||0)} · Played: {fmtS(bp.totalMs||0)}
+              </div>
+              <div style={{fontSize:12,color:"#4a6a8a",marginBottom:10}}>Sub in for:</div>
+              <div style={{display:"flex",flexDirection:"column",gap:7,maxHeight:260,overflowY:"auto"}}>
+                {shownField.map((fp,slot)=>(
+                  <button key={fp.id} onClick={safeClick(()=>{
+                    // reuse doSub logic directly
+                    const out=fp;
+                    const inP=bp;
+                    const outLabel=(out.num?"#"+out.num+" ":"")+out.name;
+                    const inLabel=(inP.num?"#"+inP.num+" ":"")+inP.name;
+                    setActiveField(fld=>{ const n=[...fld]; n[slot]={...inP,slot,isGK:out.isGK,shiftMs:0,totalMs:inP.totalMs||0,benchMs:inP.benchMs||0,gkMs:inP.gkMs||0,h1Ms:inP.h1Ms||0,h2Ms:inP.h2Ms||0}; return n; });
+                    setActiveBench(bch=>bch.filter(x=>x.id!==inP.id).concat([{...out,benchMs:out.benchMs||0}]));
+                    if (!planning) addEvt("🔄 "+inLabel+" IN for "+outLabel);
+                    setModal(null); setSelSlot(null);
+                  })} style={{...B.act("#1d4ed8","#93c5fd"),display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                    <span>{fp.num?`#${fp.num} `:""}{fp.name}{fp.isGK?" ★":""}</span>
+                    <span style={{fontSize:11,color:"#93c5fd",marginLeft:8}}>shift {fmtS(fp.shiftMs||0)}</span>
+                  </button>
+                ))}
+              </div>
+              {!bp.ejected && (
+                <button onClick={safeClick(()=>{
+                  const nowDns = !bp.dns;
+                  setActiveBench(bx=>bx.map(b=>b.id===bp.id?{...b,dns:nowDns}:b));
+                  if (nowDns) {
+                    if (!planning) addEvt(`🚫 DNS: ${bp.num?"#"+bp.num+" ":""}${bp.name} — did not show`);
+                  } else {
+                    if (!planning) addEvt(`✅ Arrived: ${bp.num?"#"+bp.num+" ":""}${bp.name} — now available`);
+                  }
+                  setModal(null);setSelSlot(null);
+                })} style={B.act(bp.dns?"#15803d":"#78350f",bp.dns?"#86efac":"#fcd34d")}>
+                  {bp.dns ? "✅ Mark as Arrived" : "🚫 Mark Did Not Show"}
+                </button>
+              )}
+              <button onClick={safeClick(()=>{setModal(null);setSelSlot(null);})} style={B.cancel()}>Cancel</button>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* Sub plan summary */}
+      {modal==="subPlanSummary" && planning && (
+        <div style={S.overlay} onClick={()=>setModal(null)}>
+          <div style={{...S.card,maxHeight:"82vh",overflowY:"auto",borderColor:"#f59e0b"}} onClick={e=>e.stopPropagation()}>
+            <div style={{fontWeight:800,fontSize:17,color:"#fbbf24",marginBottom:4}}>Sub Plan</div>
+            <div style={{fontSize:11,color:"#7aa0cc",marginBottom:12}}>
+              Shortest practical path from the current live lineup to the planned lineup.
+            </div>
+            {!subPlanSummary.hasChanges && (
+              <div style={{background:"#071120",borderRadius:10,padding:"12px",color:"#93c5fd",fontSize:13,marginBottom:12}}>
+                No lineup changes planned.
+              </div>
+            )}
+            {subPlanSummary.ops.length > 0 && (
+              <div style={{display:"flex",flexDirection:"column",gap:7,marginBottom:12}}>
+                {subPlanSummary.ops.map((op,i)=>(
+                  <div key={i} style={{background:"#071120",border:"1px solid #1e3a5f",borderRadius:10,padding:"9px 10px"}}>
+                    <div style={{fontSize:10,color:op.type==="sub"?"#4ade80":"#fbbf24",fontWeight:800,letterSpacing:0.5,marginBottom:3}}>
+                      {i+1}. {op.type==="sub"?"SUBSTITUTION":op.type==="swap"?"FIELD SWAP":"POSITION MOVE"}
+                    </div>
+                    <div style={{fontSize:13,color:"#e2e8f0",fontWeight:600}}>
+                      {op.type==="sub"
+                        ? `${playerLabel(op.inP)} IN for ${playerLabel(op.outP)}`
+                        : op.type==="swap"
+                          ? `${playerLabel(op.a)} ⇄ ${playerLabel(op.b)}`
+                          : `${playerLabel(op.p)} to planned spot`}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+            <button onClick={executeSubPlan}
+              disabled={!subPlanSummary.hasChanges}
+              style={{...B.act(subPlanSummary.hasChanges?"#15803d":"#10251a",subPlanSummary.hasChanges?"#bbf7d0":"#315743"),textAlign:"center",marginBottom:8}}>
+              Execute Sub
+            </button>
+            <button onClick={()=>setModal(null)} style={{...B.act("#f59e0b","#fff7ed"),textAlign:"center",marginBottom:8}}>
+              Keep Planning
+            </button>
+            <button onClick={cancelSubPlanning} style={B.cancel()}>Cancel Plan</button>
+          </div>
+        </div>
+      )}
+
+      {/* Save stats confirm — shown when Menu pressed mid-game */}
+      {modal==="saveStats" && (
+        <div style={S.overlay} onClick={()=>{setModal(null);setScreen("setup");}}>
+          <div style={S.card} onClick={e=>e.stopPropagation()}>
+            <div style={{fontWeight:800,fontSize:16,color:"#fff",marginBottom:8}}>Save game stats?</div>
+            <div style={{fontSize:13,color:"#7aa0cc",marginBottom:16}}>
+              Save this game's stats to the career player database before leaving?
+            </div>
+            <button onClick={()=>{saveGameToStats();setModal(null);setScreen("setup");}}
+              style={{...B.act("#15803d","#86efac"),textAlign:"center",marginBottom:8}}>
+              ✓ Save stats &amp; exit
+            </button>
+            <button onClick={()=>{setModal(null);setScreen("setup");}}
+              style={{...B.act("#7f1d1d","#fca5a5"),textAlign:"center",marginBottom:8}}>
+              ✗ Exit without saving
+            </button>
+            <button onClick={()=>setModal(null)} style={B.cancel()}>Cancel — stay in game</button>
+          </div>
+        </div>
+      )}
+
+      {/* Event log */}
+      {modal==="log" && (
+        <div style={S.overlay} onClick={safeClick(()=>setModal(null))}>
+          <div style={{...S.card,maxHeight:"70vh",overflowY:"auto"}} onClick={e=>e.stopPropagation()}>
+            <div style={{fontWeight:700,fontSize:15,marginBottom:10,color:"#fff"}}>Event Log</div>
+            {events.length===0 && <div style={{color:"#4a6a8a",fontSize:13}}>No events yet</div>}
+            {[...events].reverse().map((ev,i)=>(
+              <div key={i} style={{fontSize:12,padding:"5px 0",borderBottom:"1px solid #1e3a5f",color:"#93c5fd"}}>
+                <span style={{color:"#4a6a8a",marginRight:8}}>{ev.time}</span>{ev.text}
+              </div>
+            ))}
+            <button onClick={safeClick(()=>setModal(null))} style={B.cancel()}>Close</button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Setup Screen ──────────────────────────────────────────────────────────────
+function Setup({
+  teamName, setTeamName, teamSize, roster,
+  newName, setNewName, newNum, setNewNum,
+  addPlayer, removePlayer, changeTeamSize,
+  rosters, saveRoster, loadRoster, deleteRoster, setDefaultRoster, importRosterCSV,
+  saveRosterName, setSaveRosterName, rosterModal, setRosterModal,
+  savedGames, deleteGame, loadGameSummary, exportGameCSV,
+  gameListModal, setGameListModal,
+  gameSetups, gameSetupModal, setGameSetupModal,
+  saveGameSetup, loadGameSetup, deleteGameSetup, lastLoadedSetupName,
+  selectedPlayers, togglePlayerSelected, selectAllPlayers, clearAllSelected, selectPlayersByTeam,
+  h1Formation, h2Formation, openFormation,
+  gameInProgress, onReturnToGame,
+  opponent, setOpponent, gameDate, setGameDate, competition, setCompetition,
+  settingsModal, setSettingsModal, showJerseyNum, setShowJerseyNum,
+  showPlayerTeam, setShowPlayerTeam,
+  showHalfCols, setShowHalfCols,
+  snapToGrid, setSnapToGrid, showGrid, setShowGrid,
+  subPlanMode, setSubPlanMode,
+  statsModal, setStatsModal, playerStats, setPlayerStats,
+}) {
+  const numSelected = selectedPlayers.size;
+  const enough = numSelected >= teamSize;
+  const [csvError, setCsvError] = useState("");
+  const [rosterTab, setRosterTab] = useState("list"); // "list"|"save"|"import"
+  const [saveSetupName, setSaveSetupName] = useState("");
+  const [rosterSort, setRosterSort] = useState("roster"); // "roster"|"num"|"first"|"last"
+  const [teamSelectModal, setTeamSelectModal] = useState(false);
+  const rosterTeams = [...new Set(roster.map(p => normalizeTeamName(p.team)).filter(Boolean))].sort((a,b)=>a.localeCompare(b));
+
+  const S2 = (bg,tc) => ({padding:"7px 12px",borderRadius:8,border:"none",
+    background:bg,color:tc,fontWeight:600,fontSize:12,cursor:"pointer",flexShrink:0});
+
+  return (
+    <div style={{fontFamily:"system-ui,sans-serif",background:"#071120",height:"100dvh",overflowY:"auto",WebkitOverflowScrolling:"touch",overscrollBehavior:"contain",color:"#fff",padding:"14px",paddingBottom:"calc(18px + env(safe-area-inset-bottom))",maxWidth:480,margin:"0 auto"}}>
+
+      {/* ── Header ── */}
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:16}}>
+        <div style={{display:"flex",alignItems:"center",gap:8}}>
+          <span style={{fontSize:22}}>⚽</span>
+          <span style={{fontSize:18,fontWeight:800,color:"#60a5fa"}}>Sub Tracker</span>
+        </div>
+        <div style={{display:"flex",gap:6}}>
+          <button onClick={()=>setStatsModal(true)} style={S2("#0d1f3c","#34d399")}>📊 Stats</button>
+          <button onClick={()=>setSettingsModal(true)} style={S2("#0d1f3c","#fbbf24")}>⚙</button>
+        </div>
+      </div>
+
+      {/* ── ROSTER SECTION ── */}
+      <div style={{background:"#0d1f3c",borderRadius:12,padding:"12px 14px",marginBottom:12,overflow:"hidden"}}>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10}}>
+          <span style={{fontSize:13,fontWeight:700,color:"#60a5fa"}}>👥 Roster</span>
+          <div style={{display:"flex",gap:6}}>
+            <button onClick={()=>setRosterModal(true)} style={S2("#1e3a5f","#93c5fd")}>📂 Load</button>
+            <button onClick={()=>{ setSaveRosterName(teamName); setRosterModal("save"); }}
+              disabled={roster.length===0}
+              style={S2(roster.length===0?"#0d1a2a":"#1e3a5f",roster.length===0?"#4a6a8a":"#93c5fd")}>
+              💾 Save
+            </button>
+          </div>
+        </div>
+
+        <input value={teamName} onChange={e=>setTeamName(e.target.value)}
+          style={{...B.inp(),marginBottom:8,fontSize:15,fontWeight:700}}
+          placeholder="Team name"/>
+
+        <div style={{display:"flex",gap:6,marginBottom:8,alignItems:"center"}}>
+          <input value={newNum} onChange={e=>setNewNum(e.target.value)}
+            style={{...B.inp(),width:46,marginBottom:0,textAlign:"center",flexShrink:0,padding:"9px 4px"}}
+            placeholder="#"/>
+          <input value={newName} onChange={e=>setNewName(e.target.value)}
+            onKeyDown={e=>e.key==="Enter"&&addPlayer()}
+            style={{...B.inp(),flex:1,marginBottom:0}} placeholder="Player name"/>
+          <button onClick={addPlayer}
+            style={{background:"#1d4ed8",border:"none",color:"#fff",padding:"9px 12px",
+              borderRadius:9,fontWeight:700,fontSize:13,cursor:"pointer",flexShrink:0}}>
+            + Add
+          </button>
+        </div>
+
+        {/* Team size */}
+        <div style={{display:"flex",gap:6,marginBottom:8}}>
+          {[7,9,11].map(n=>(
+            <button key={n} onClick={()=>changeTeamSize(n)}
+              style={{flex:1,padding:"8px 0",borderRadius:8,
+                border:teamSize===n?"2px solid #3b82f6":"1px solid #1e3a5f",
+                background:teamSize===n?"#1d4ed8":"#071120",
+                color:teamSize===n?"#fff":"#7aa0cc",fontWeight:700,fontSize:14,cursor:"pointer"}}>
+              {n}v{n}
+            </button>
+          ))}
+        </div>
+
+        {/* Player list with game selection */}
+        {roster.length > 0 && (
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4,gap:4}}>
+            <span style={{fontSize:9,color:"#4a6a8a",fontWeight:700,letterSpacing:0.5,flexShrink:0}}>
+              {selectedPlayers.size}/{roster.length} in game
+            </span>
+            <div style={{display:"flex",gap:3,flex:1,justifyContent:"center"}}>
+              {[["roster","Order"],["num","#"],["first","First"],["last","Last"]].map(([k,l])=>(
+                <button key={k} onClick={()=>setRosterSort(k)}
+                  style={{fontSize:9,padding:"2px 6px",borderRadius:5,border:"none",
+                    background:rosterSort===k?"#1d4ed8":"#1e3a5f",
+                    color:rosterSort===k?"#fff":"#7aa0cc",cursor:"pointer",fontWeight:rosterSort===k?700:400}}>
+                  {l}
+                </button>
+              ))}
+            </div>
+            <div style={{display:"flex",gap:4,flexShrink:0}}>
+              {rosterTeams.length>0 && <button onClick={()=>setTeamSelectModal(true)}
+                style={{fontSize:9,padding:"2px 6px",borderRadius:5,border:"none",
+                  background:"#0e7490",color:"#cffafe",cursor:"pointer",fontWeight:700}}>Team</button>}
+              <button onClick={selectAllPlayers}
+                style={{fontSize:9,padding:"2px 6px",borderRadius:5,border:"none",
+                  background:"#1e3a5f",color:"#93c5fd",cursor:"pointer"}}>All</button>
+              <button onClick={clearAllSelected}
+                style={{fontSize:9,padding:"2px 6px",borderRadius:5,border:"none",
+                  background:"#1e3a5f",color:"#7aa0cc",cursor:"pointer"}}>None</button>
+            </div>
+          </div>
+        )}
+        <div style={{height:200,overflowY:"auto",overflowX:"hidden",WebkitOverflowScrolling:"touch",overscrollBehavior:"contain",display:"flex",flexDirection:"column",gap:3,flexShrink:0,contain:"layout paint"}}>
+          {(()=>{
+            const sorted = [...roster].sort((a,b)=>{
+              if(rosterSort==="num") return (parseInt(a.num)||999)-(parseInt(b.num)||999);
+              if(rosterSort==="first") return a.name.localeCompare(b.name);
+              if(rosterSort==="last") return (a.lastName||a.name).localeCompare(b.lastName||b.name);
+              return 0; // "roster" = original order
+            });
+            return sorted;
+          })().map((p,i)=>{
+            const inGame = selectedPlayers.has(p.id);
+            const tColor = showPlayerTeam && p.team ? teamColor(p.team) : null;
+            return (
+              <div key={p.id} style={{display:"flex",alignItems:"center",gap:0,
+                background:tColor ? tColor.bg : inGame?"#0d2a4a":"#071120",
+                borderRadius:7,border:tColor ? "1px solid "+tColor.border : inGame?"1px solid #1e4a7a":"1px solid transparent",
+                overflow:"hidden",flexShrink:0,minHeight:36}}>
+                {/* Selection toggle */}
+                <button onClick={()=>togglePlayerSelected(p.id)}
+                  style={{width:34,alignSelf:"stretch",background:inGame?"#1d4ed8":"#0a1a2e",
+                    border:"none",borderRight:"1px solid #0d1f3c",cursor:"pointer",
+                    display:"flex",alignItems:"center",justifyContent:"center",
+                    fontSize:14,color:inGame?"#fff":"#2d4a6a",flexShrink:0}}>
+                  {inGame?"✓":""}
+                </button>
+                {/* Player info */}
+                <div style={{display:"flex",alignItems:"center",gap:6,flex:1,padding:"6px 8px"}}>
+                  <span style={{fontSize:12,color:inGame?"#60a5fa":"#2d4a7a",fontWeight:700,minWidth:24}}>
+                    {p.num?`#${p.num}`:`#${i+1}`}
+                  </span>
+                  <span style={{fontSize:13,flex:1,color:inGame?"#e2e8f0":"#4a6a8a",fontWeight:inGame?500:400}}>
+                    {p.name}{p.lastName?" "+p.lastName:""}
+                    {tColor && <span style={{fontSize:9,color:tColor.text,marginLeft:6,fontWeight:700}}>{p.team}</span>}
+                  </span>
+                  <button onClick={()=>removePlayer(p.id)}
+                    style={{background:"transparent",border:"none",color:"#7f1d1d",
+                      cursor:"pointer",fontSize:16,lineHeight:1,padding:0}}>×</button>
+                </div>
+              </div>
+            );
+          })}
+          {roster.length===0 && (
+            <div style={{color:"#4a6a8a",fontSize:12,textAlign:"center",padding:12}}>
+              No players — add above or load a roster.
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* ── GAME SECTION ── */}
+      <div style={{background:"#0d1f3c",borderRadius:12,padding:"12px 14px",marginBottom:12}}>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10}}>
+          <span style={{display:"flex",alignItems:"center",gap:6,fontSize:13,fontWeight:700,color:"#a78bfa"}}>
+            <svg width="28" height="20" viewBox="0 0 56 40" xmlns="http://www.w3.org/2000/svg"
+              style={{flexShrink:0}}>
+              <rect width="56" height="40" rx="3" fill="#1a6b32"/>
+              <rect x="1.5" y="1.5" width="53" height="37" rx="2" fill="none" stroke="#2d8a4a" strokeWidth="1"/>
+              <line x1="28" y1="1.5" x2="28" y2="38.5" stroke="#2d8a4a" strokeWidth="1"/>
+              <circle cx="28" cy="20" r="6" fill="none" stroke="#2d8a4a" strokeWidth="1"/>
+              <circle cx="28" cy="20" r="1" fill="#2d8a4a"/>
+              <rect x="1.5" y="13" width="7" height="14" rx="1" fill="none" stroke="#2d8a4a" strokeWidth="1"/>
+              <rect x="47.5" y="13" width="7" height="14" rx="1" fill="none" stroke="#2d8a4a" strokeWidth="1"/>
+              <rect x="1.5" y="16" width="3" height="8" rx="1" fill="none" stroke="#2d8a4a" strokeWidth="0.8"/>
+              <rect x="51.5" y="16" width="3" height="8" rx="1" fill="none" stroke="#2d8a4a" strokeWidth="0.8"/>
+            </svg>
+            Game
+          </span>
+          <div style={{display:"flex",gap:6}}>
+            <button onClick={()=>setGameSetupModal("load")} style={S2("#1e3a5f","#c4b5fd")}>📂 Load</button>
+            <button onClick={()=>{ setSaveSetupName(lastLoadedSetupName || (teamName+" vs "+(opponent||"TBD"))); setGameSetupModal("save"); }} style={S2("#1e3a5f","#c4b5fd")}>💾 Save</button>
+            <button onClick={()=>setGameListModal(true)} style={S2("#1e3a5f","#a78bfa")}>📋 Past</button>
+          </div>
+        </div>
+
+        <input value={opponent} onChange={e=>setOpponent(e.target.value)}
+          style={{...B.inp(),marginBottom:8}} placeholder="Opponent"/>
+        <input value={competition} onChange={e=>setCompetition(e.target.value)}
+          style={{...B.inp(),marginBottom:8}} placeholder="Competition (League / Cup / Friendly)"/>
+        <input value={gameDate} onChange={e=>setGameDate(e.target.value)}
+          style={{...B.inp(),marginBottom:10}}
+          placeholder={new Date().toLocaleDateString()}/>
+
+        {gameInProgress && (
+          <button onClick={onReturnToGame}
+            style={{width:"100%",padding:"11px",borderRadius:10,border:"2px solid #4ade80",
+              background:"#14532d",color:"#4ade80",fontWeight:700,fontSize:14,
+              cursor:"pointer",marginBottom:10}}>
+            ▶ Return to Current Game
+          </button>
+        )}
+
+        {!enough ? (
+          <div style={{textAlign:"center",color:"#4a6a8a",fontSize:12,padding:"8px 0"}}>
+            Select {teamSize-numSelected} more player(s) to plan formations (have {numSelected} of {teamSize} needed)
+          </div>
+        ) : (
+          <div style={{display:"flex",gap:8}}>
+            <button onClick={()=>openFormation("h1")}
+              style={{flex:1,padding:"12px 0",borderRadius:10,border:"none",
+                background:h1Formation?"#1d4ed8":"#0d3a7c",color:"#bfdbfe",
+                fontWeight:700,fontSize:13,cursor:"pointer"}}>
+              {h1Formation?"✓ ":""}1st Half
+              <div style={{fontSize:9,color:"#93c5fd",marginTop:2,fontWeight:400}}>Formation</div>
+            </button>
+            <button onClick={()=>openFormation("h2")}
+              style={{flex:1,padding:"12px 0",borderRadius:10,border:"none",
+                background:h2Formation?"#15803d":"#0a3d1f",color:"#bbf7d0",
+                fontWeight:700,fontSize:13,cursor:"pointer"}}>
+              {h2Formation?"✓ ":""}2nd Half
+              <div style={{fontSize:9,color:"#86efac",marginTop:2,fontWeight:400}}>Formation</div>
+            </button>
+          </div>
+        )}
+      </div>
+
+      {/* ── TEAM SELECTION MODAL ── */}
+      {teamSelectModal && (
+        <div style={S.overlay} onClick={()=>setTeamSelectModal(false)}>
+          <div style={{...S.card,maxHeight:"80vh",overflowY:"auto"}} onClick={e=>e.stopPropagation()}>
+            <div style={{fontWeight:700,fontSize:15,color:"#fff",marginBottom:4}}>Select Players By Team</div>
+            <div style={{fontSize:11,color:"#7aa0cc",marginBottom:12}}>
+              Selects everyone with the chosen team label for this game.
+            </div>
+            <div style={{display:"flex",flexDirection:"column",gap:7}}>
+              {rosterTeams.map(team => {
+                const c = teamColor(team);
+                const count = roster.filter(p => normalizeTeamName(p.team) === team).length;
+                return (
+                  <button key={team} onClick={()=>{
+                    selectPlayersByTeam(team);
+                    setTeamSelectModal(false);
+                  }} style={{...B.act(c.bg,c.text),border:"1px solid "+c.border,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                    <span>{team}</span>
+                    <span style={{fontSize:11,color:c.text,opacity:0.85}}>{count} player{count!==1?"s":""}</span>
+                  </button>
+                );
+              })}
+            </div>
+            <button onClick={()=>setTeamSelectModal(false)} style={B.cancel()}>Cancel</button>
+          </div>
+        </div>
+      )}
+
+      {/* ── SAVE GAME SETUP MODAL ── */}
+      {gameSetupModal==="save" && (
+        <div style={S.overlay} onClick={()=>setGameSetupModal(false)}>
+          <div style={S.card} onClick={e=>e.stopPropagation()}>
+            <div style={{fontWeight:700,fontSize:15,color:"#fff",marginBottom:4}}>💾 Save Game Setup</div>
+            <div style={{fontSize:11,color:"#7aa0cc",marginBottom:10}}>
+              Saves roster, formations, opponent and competition as a reusable template. No game data is saved.
+            </div>
+            <input
+              value={saveSetupName}
+              onChange={e=>setSaveSetupName(e.target.value)}
+              style={{...B.inp()}} placeholder="Setup name"/>
+            <div style={{fontSize:10,color:"#4a6a8a",marginBottom:10}}>
+              {roster.length} players · {teamSize}v{teamSize}
+              {h1Formation?" · H1 formation":""}
+              {h2Formation?" · H2 formation":""}
+            </div>
+            <button
+              onClick={()=>{ saveGameSetup(saveSetupName.trim() || "Untitled Setup"); setSaveSetupName(""); setLastLoadedSetupName(""); }}
+              style={{...B.act("#15803d","#86efac"),width:"100%",textAlign:"center",marginBottom:6}}>
+              Save Setup
+            </button>
+            <button onClick={()=>{ setGameSetupModal(false); setSaveSetupName(""); }} style={B.cancel()}>Cancel</button>
+          </div>
+        </div>
+      )}
+
+      {/* ── LOAD GAME SETUP MODAL ── */}
+      {gameSetupModal==="load" && (
+        <div style={S.overlay} onClick={()=>setGameSetupModal(false)}>
+          <div style={{...S.card,maxHeight:"85vh",overflowY:"auto"}} onClick={e=>e.stopPropagation()}>
+            <div style={{fontWeight:700,fontSize:15,color:"#fff",marginBottom:4}}>📂 Load Game Setup</div>
+            <div style={{fontSize:11,color:"#7aa0cc",marginBottom:10}}>
+              Loads roster and formations as a template. Enter a new date before starting.
+            </div>
+            {gameSetups.length===0 && (
+              <div style={{color:"#4a6a8a",fontSize:13,textAlign:"center",padding:12}}>
+                No saved setups yet.
+              </div>
+            )}
+            {[...gameSetups].sort((a,b)=>(b.savedAt||0)-(a.savedAt||0)).map(gs=>(
+              <div key={gs.id} style={{background:"#071120",borderRadius:10,padding:"10px 12px",marginBottom:8}}>
+                <div style={{fontWeight:700,color:"#e2e8f0",fontSize:13,marginBottom:2}}>{gs.name}</div>
+                <div style={{fontSize:10,color:"#7aa0cc",marginBottom:6}}>
+                  {gs.teamName} · {gs.teamSize}v{gs.teamSize} · {(gs.roster||[]).length} players
+                  {gs.opponent?" vs "+gs.opponent:""}
+                  {gs.competition?" · "+gs.competition:""}
+                  {gs.h1Formation?" · H1✓":""}
+                  {gs.h2Formation?" · H2✓":""}
+                </div>
+                <div style={{fontSize:9,color:"#4a6a8a",marginBottom:8}}>
+                  {(gs.roster||[]).slice(0,6).map(p=>(p.num?"#"+p.num+" ":"")+p.name).join(", ")}
+                  {(gs.roster||[]).length>6?"…":""}
+                </div>
+                <div style={{display:"flex",gap:6}}>
+                  <button onClick={()=>loadGameSetup(gs)}
+                    style={{...B.act("#1d4ed8","#93c5fd"),flex:2,textAlign:"center",padding:"7px"}}>
+                    Load
+                  </button>
+                  <button onClick={()=>{if(window.confirm("Delete this setup?"))deleteGameSetup(gs.id);}}
+                    style={{background:"#7f1d1d",border:"none",color:"#fca5a5",
+                      padding:"7px 10px",borderRadius:8,cursor:"pointer"}}>
+                    🗑
+                  </button>
+                </div>
+              </div>
+            ))}
+            <button onClick={()=>setGameSetupModal(false)} style={B.cancel()}>Close</button>
+          </div>
+        </div>
+      )}
+
+      {/* ── LOAD ROSTER MODAL ── */}
+      {rosterModal && rosterModal !== "save" && (
+        <div style={S.overlay} onClick={()=>{setRosterModal(false);setCsvError("");}}>
+          <div style={{...S.card,maxHeight:"85vh",overflowY:"auto"}} onClick={e=>e.stopPropagation()}>
+            <div style={{fontWeight:700,fontSize:15,color:"#fff",marginBottom:4}}>📂 Rosters</div>
+
+            {/* Tabs */}
+            <div style={{display:"flex",gap:6,marginBottom:12}}>
+              {["list","import"].map(t=>(
+                <button key={t} onClick={()=>setRosterTab(t)}
+                  style={{flex:1,padding:"6px",borderRadius:8,border:"none",
+                    background:rosterTab===t?"#1d4ed8":"#071120",
+                    color:rosterTab===t?"#fff":"#7aa0cc",fontWeight:600,fontSize:12,cursor:"pointer"}}>
+                  {t==="list"?"Saved Rosters":"Import CSV"}
+                </button>
+              ))}
+            </div>
+
+            {rosterTab==="list" && (<>
+              {rosters.length===0 && (
+                <div style={{color:"#4a6a8a",fontSize:13,textAlign:"center",padding:12}}>
+                  No saved rosters yet.
+                </div>
+              )}
+              {rosters.map(r=>(
+                <div key={r.id} style={{background:"#071120",borderRadius:10,padding:"10px 12px",marginBottom:8}}>
+                  <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:6}}>
+                    <span style={{flex:1,fontWeight:700,color:"#e2e8f0",fontSize:13}}>
+                      {r.name}
+                      {r.isDefault&&<span style={{fontSize:9,color:"#4ade80",marginLeft:6,background:"#14532d",padding:"1px 5px",borderRadius:4}}>DEFAULT</span>}
+                    </span>
+                    <span style={{fontSize:10,color:"#4a6a8a"}}>{r.teamSize}v{r.teamSize} · {r.players.length}p</span>
+                  </div>
+                  <div style={{fontSize:10,color:"#4a6a8a",marginBottom:8}}>
+                    {r.players.slice(0,8).map(p=>(p.num?"#"+p.num+" ":"")+p.name).join(", ")}
+                    {r.players.length>8?"…":""}
+                  </div>
+                  <div style={{display:"flex",gap:6}}>
+                    <button onClick={()=>loadRoster(r)}
+                      style={{...B.act("#1d4ed8","#93c5fd"),flex:2,textAlign:"center",padding:"7px"}}>
+                      Load
+                    </button>
+                    <button onClick={()=>setDefaultRoster(r.id)}
+                      style={{...B.act("#14532d","#4ade80"),flex:2,textAlign:"center",padding:"7px"}}>
+                      {r.isDefault?"✓ Default":"Set Default"}
+                    </button>
+                    <button onClick={()=>{if(window.confirm("Delete roster "+r.name+"?"))deleteRoster(r.id);}}
+                      style={{background:"#7f1d1d",border:"none",color:"#fca5a5",padding:"7px 10px",borderRadius:8,cursor:"pointer"}}>
+                      🗑
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </>)}
+
+            {rosterTab==="import" && (<>
+              <div style={{fontSize:12,color:"#7aa0cc",marginBottom:8}}>
+                CSV columns can be in any order: <code style={{color:"#a78bfa"}}>Name, Jersey #, Team</code>. A header row helps, but the app will infer columns when possible.
+              </div>
+              <label style={{display:"block",marginBottom:8}}>
+                <div style={{...B.act("#1e3a5f","#a78bfa"),textAlign:"center",cursor:"pointer",padding:"10px"}}>
+                  📂 Choose CSV file…
+                  <input type="file" accept=".csv,text/csv" style={{display:"none"}}
+                    onChange={e=>{
+                      const file=e.target.files?.[0]; if(!file) return;
+                      const reader=new FileReader();
+                      reader.onload=ev=>{
+                        const count=importRosterCSV(ev.target.result);
+                        if(count>0){setCsvError("");setRosterModal(false);}
+                        else setCsvError("No valid players found. Check format: #, Name, Last Name");
+                      };
+                      reader.readAsText(file);
+                      e.target.value="";
+                    }}
+                  />
+                </div>
+              </label>
+              {csvError&&<div style={{fontSize:11,color:"#fca5a5",marginBottom:6}}>{csvError}</div>}
+            </>)}
+
+            <button onClick={()=>{setRosterModal(false);setCsvError("");}} style={B.cancel()}>Close</button>
+          </div>
+        </div>
+      )}
+
+      {/* ── SAVE ROSTER MODAL ── */}
+      {rosterModal==="save" && (
+        <div style={S.overlay} onClick={()=>setRosterModal(false)}>
+          <div style={S.card} onClick={e=>e.stopPropagation()}>
+            <div style={{fontWeight:700,fontSize:15,color:"#fff",marginBottom:10}}>💾 Save Roster</div>
+            <input value={saveRosterName} onChange={e=>setSaveRosterName(e.target.value)}
+              placeholder={teamName} style={B.inp()}/>
+            <div style={{fontSize:11,color:"#4a6a8a",marginBottom:10}}>
+              {roster.length} player{roster.length!==1?"s":""} · {teamSize}v{teamSize}
+              {(h1Formation||h2Formation)?" · Formations included":""}
+            </div>
+            <button onClick={()=>saveRoster(saveRosterName||teamName)}
+              style={{...B.act("#15803d","#86efac"),width:"100%",textAlign:"center",marginBottom:6}}>
+              Save
+            </button>
+            <button onClick={()=>setRosterModal(false)} style={B.cancel()}>Cancel</button>
+          </div>
+        </div>
+      )}
+
+      {/* ── PAST GAMES MODAL ── */}
+      {gameListModal && (
+        <div style={S.overlay} onClick={()=>setGameListModal(false)}>
+          <div style={{...S.card,maxHeight:"85vh",overflowY:"auto"}} onClick={e=>e.stopPropagation()}>
+            <div style={{fontWeight:700,fontSize:15,color:"#fff",marginBottom:10}}>📋 Past Games</div>
+            {Object.keys(savedGames).length===0 && (
+              <div style={{color:"#4a6a8a",fontSize:13,textAlign:"center",padding:12}}>
+                No saved games yet.
+              </div>
+            )}
+            {Object.values(savedGames).sort((a,b)=>(b.savedAt||0)-(a.savedAt||0)).map(g=>(
+              <div key={g.id} style={{background:"#071120",borderRadius:10,padding:"10px 12px",marginBottom:8}}>
+                <div style={{fontWeight:700,color:"#e2e8f0",fontSize:13,marginBottom:2}}>
+                  {g.teamName} {g.score?.us??""} : {g.score?.them??""} {g.opponent}
+                </div>
+                <div style={{fontSize:10,color:"#7aa0cc",marginBottom:8}}>
+                  {g.date}{g.competition?" · "+g.competition:""} · {(g.players||[]).length} players
+                </div>
+                <div style={{display:"flex",gap:6}}>
+                  <button onClick={()=>loadGameSummary(g)}
+                    style={{...B.act("#1d4ed8","#93c5fd"),flex:2,textAlign:"center",padding:"7px"}}>
+                    View
+                  </button>
+                  <button onClick={()=>exportGameCSV(g)}
+                    style={{...B.act("#14532d","#4ade80"),flex:2,textAlign:"center",padding:"7px"}}>
+                    Export CSV
+                  </button>
+                  <button onClick={()=>{if(window.confirm("Delete this game?"))deleteGame(g.id);}}
+                    style={{background:"#7f1d1d",border:"none",color:"#fca5a5",padding:"7px 10px",borderRadius:8,cursor:"pointer"}}>
+                    🗑
+                  </button>
+                </div>
+              </div>
+            ))}
+            <button onClick={()=>setGameListModal(false)} style={B.cancel()}>Close</button>
+          </div>
+        </div>
+      )}
+
+      {/* ── SETTINGS MODAL ── */}
+      {settingsModal && (
+        <div style={S.overlay} onClick={()=>setSettingsModal(false)}>
+          <div style={S.card} onClick={e=>e.stopPropagation()}>
+            <div style={{fontWeight:700,fontSize:15,marginBottom:14,color:"#fff"}}>⚙ Settings</div>
+            {[
+              {label:"Show Jersey Numbers",sub:"Display #number after player name",val:showJerseyNum,set:setShowJerseyNum},
+              {label:"Show Team Colors",sub:"Color roster rows by imported team label",val:showPlayerTeam,set:setShowPlayerTeam},
+              {label:"Show Half Columns",sub:"Show 1st/2nd half time in table view",val:showHalfCols,set:setShowHalfCols},
+              {label:"Snap to Grid",sub:"Players snap to nearest position grid point when dropped",val:snapToGrid,set:setSnapToGrid},
+              {label:"Show Grid",sub:"Show position grid points on the field",val:showGrid,set:setShowGrid},
+            ].map(({label,sub,val,set})=>(
+              <div key={label} style={{display:"flex",alignItems:"center",justifyContent:"space-between",
+                background:"#071120",borderRadius:10,padding:"12px 14px",marginBottom:8}}>
+                <div>
+                  <div style={{fontSize:14,color:"#e2e8f0",fontWeight:600}}>{label}</div>
+                  <div style={{fontSize:11,color:"#4a6a8a",marginTop:2}}>{sub}</div>
+                </div>
+                <div onClick={()=>set(v=>!v)}
+                  style={{width:44,height:26,borderRadius:13,background:val?"#15803d":"#1e3a5f",
+                    border:"2px solid "+(val?"#4ade80":"#2d5a8f"),cursor:"pointer",
+                    position:"relative",transition:"background 0.2s",flexShrink:0}}>
+                  <div style={{position:"absolute",top:2,left:val?20:2,width:18,height:18,
+                    borderRadius:"50%",background:val?"#4ade80":"#4a6a8a",transition:"left 0.2s"}}/>
+                </div>
+              </div>
+            ))}
+            <button onClick={()=>setSettingsModal(false)} style={B.cancel()}>Close</button>
+          </div>
+        </div>
+      )}
+
+      {/* ── STATS MODAL ── */}
+      {statsModal && (
+        <div style={S.overlay} onClick={()=>setStatsModal(false)}>
+          <div style={{...S.card,maxHeight:"85vh",overflowY:"auto"}} onClick={e=>e.stopPropagation()}>
+            <div style={{fontWeight:700,fontSize:15,marginBottom:4,color:"#fff"}}>📊 Career Player Stats</div>
+            <div style={{fontSize:10,color:"#4a6a8a",marginBottom:12}}>Cumulative across all tracked games</div>
+            {Object.keys(playerStats).length===0 && (
+              <div style={{color:"#4a6a8a",fontSize:13,textAlign:"center",padding:16}}>
+                No stats yet — complete a game to see stats here.
+              </div>
+            )}
+            {Object.values(playerStats).sort((a,b)=>b.goals-a.goals).map(p=>(
+              <div key={p.id} style={{background:"#071120",borderRadius:10,padding:"10px 12px",marginBottom:8}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
+                  <div>
+                    <span style={{fontSize:13,fontWeight:700,color:"#e2e8f0"}}>{p.name}</span>
+                    {p.num&&<span style={{fontSize:11,color:"#60a5fa",marginLeft:6}}>#{p.num}</span>}
+                    {p.lastName&&<span style={{fontSize:11,color:"#4a6a8a",marginLeft:4}}>{p.lastName}</span>}
+                  </div>
+                  <span style={{fontSize:10,color:"#4a6a8a"}}>{p.games} game{p.games!==1?"s":""}</span>
+                </div>
+                <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:4,fontSize:11,marginBottom:4}}>
+                  <div style={{textAlign:"center"}}>
+                    <div style={{color:"#f59e0b",fontWeight:700,fontSize:15}}>{p.goals||0}</div>
+                    <div style={{color:"#4a6a8a"}}>scored</div>
+                  </div>
+                  <div style={{textAlign:"center"}}>
+                    <div style={{color:"#4ade80",fontWeight:700}}>{Math.round((p.totalMs||0)/60000)}m</div>
+                    <div style={{color:"#4a6a8a"}}>minutes</div>
+                  </div>
+                  <div style={{textAlign:"center"}}>
+                    <div style={{color:"#e2e8f0",fontWeight:700}}>{p.games||0}</div>
+                    <div style={{color:"#4a6a8a"}}>games</div>
+                  </div>
+                </div>
+                <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:4,fontSize:11}}>
+                  <div style={{textAlign:"center"}}>
+                    <div style={{color:"#60a5fa",fontWeight:700}}>{p.goalsFor||0}:{p.goalsAgainst||0}</div>
+                    <div style={{color:"#4a6a8a"}}>on-field ±</div>
+                  </div>
+                  <div style={{textAlign:"center"}}>
+                    <div style={{color:"#fbbf24",fontWeight:700}}>{fmtS(p.gkMs||0)}</div>
+                    <div style={{color:"#4a6a8a"}}>as GK</div>
+                  </div>
+                  <div style={{textAlign:"center"}}>
+                    <div style={{color:"#f87171",fontWeight:700}}>{(p.yellowCards||0)}🟨{(p.redCards||0)}🟥</div>
+                    <div style={{color:"#4a6a8a"}}>cards</div>
+                  </div>
+                </div>
+                {p.teams&&p.teams.length>0&&<div style={{fontSize:9,color:"#4a6a8a",marginTop:4}}>Teams: {p.teams.join(", ")}</div>}
+                {p.competitions&&p.competitions.length>0&&<div style={{fontSize:9,color:"#7aa0cc",marginTop:2}}>Competitions: {p.competitions.join(", ")}</div>}
+                <div style={{marginTop:6}}>
+                  <input placeholder="Last name (optional — shared across teams)" value={p.lastName||""}
+                    onChange={e=>{const v=e.target.value;setPlayerStats(prev=>{const next={...prev,[p.id]:{...prev[p.id],lastName:v}};persistStats(next);return next;});}}
+                    style={{width:"100%",background:"#0d1f3c",border:"1px solid #1e3a5f",borderRadius:6,
+                      color:"#fff",fontSize:11,padding:"4px 8px",outline:"none"}}/>
+                </div>
+              </div>
+            ))}
+            <div style={{display:"flex",gap:8,marginTop:4}}>
+              <button onClick={()=>setStatsModal(false)} style={{...B.cancel(),marginTop:0,flex:1}}>Close</button>
+              <button onClick={()=>{if(window.confirm("Clear ALL career stats? This cannot be undone.")){setPlayerStats({});persistStats({});}}}
+                style={{flex:1,padding:"7px",background:"transparent",border:"1px solid #7f1d1d",
+                  borderRadius:8,color:"#fca5a5",cursor:"pointer",fontSize:13}}>
+                🗑 Clear All Stats
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+    </div>
+  );
+}
+
+// ── Formation Planner Screen ──────────────────────────────────────────────────
+// Shared field editor used for both h1 and h2 formation planning.
+// Uses the same SVG drag logic as the game screen.
+function FormationPlanner({ which, field, bench, pos, goals, setField, setBench, setPos, teamName, teamSize, showJerseyNum, snapToGrid, showGrid, lineConfig, setLineConfig, onSave, onLaunch, onOther, onMenu, otherLabel, isH2 }) {
+  const svgRef2       = useRef(null);
+  const dragRef       = useRef(null);   // field circle drag
+  const benchDragRef2 = useRef(null);   // bench→field drag
+  const modalOpenedAt2 = useRef(0);
+  const FIELD_W2 = 360, FIELD_H2 = 460;
+
+  const [drag, setDragL]           = useState(null);
+  const [selSlot, setSelSlot]       = useState(null);
+  const [modal, setModal]           = useState(null);
+  const [benchDragState2, setBDS2]  = useState(null); // {benchIdx, x, y, hoverSlot}
+  const [fpFieldHover, setFpFieldHover] = useState(null); // slot hovered during field drag
+  const [fpBlink, setFpBlink]       = useState(null);
+  const [fpBlink2, setFpBlink2]     = useState(null);
+
+  // ── Field circle drag — window-level so it works into bench area ────────────
+  const benchContRef2 = useRef(null);
+  const [fieldDrag2Ghost, setFieldDrag2Ghost] = useState(null); // {x,y,name,num}
+  const [fieldDragOver2, setFieldDragOver2]   = useState(null); // hovered bench origIdx
+
+  function svgPt2(clientX, clientY) {
+    const svg = svgRef2.current; if (!svg) return null;
+    const r = svg.getBoundingClientRect();
+    return { x:((clientX-r.left)/r.width)*FIELD_W2, y:((clientY-r.top)/r.height)*FIELD_H2 };
+  }
+
+  function getFpFieldSlot(clientX, clientY, excludeSlot) {
+    const svg = svgRef2.current; if (!svg) return null;
+    const r = svg.getBoundingClientRect();
+    const sx = ((clientX-r.left)/r.width)*FIELD_W2;
+    const sy = ((clientY-r.top)/r.height)*FIELD_H2;
+    let best=null, bestD=38;
+    field.forEach((_,slot)=>{
+      if(slot===excludeSlot) return;
+      const fp=pos[slot]||{x:50,y:50};
+      const d=Math.hypot(sx-fp.x,sy-fp.y);
+      if(d<bestD){bestD=d;best=slot;}
+    });
+    return best;
+  }
+
+  function getBenchIdx2(clientX, clientY) {
+    const bc = benchContRef2.current; if (!bc) return null;
+    const r = bc.getBoundingClientRect();
+    if (clientY<r.top||clientY>r.bottom||clientX<r.left||clientX>r.right) return null;
+    let found=null;
+    bc.querySelectorAll('[data-benchidx2]').forEach(el=>{
+      const er=el.getBoundingClientRect();
+      if(clientX>=er.left&&clientX<=er.right&&clientY>=er.top&&clientY<=er.bottom)
+        found=parseInt(el.getAttribute('data-benchidx2'));
+    });
+    return found;
+  }
+
+  useEffect(()=>{
+    if(!drag) return;
+    function mv(e){
+      const t=e.touches?.[0]||e; const cx=t.clientX,cy=t.clientY;
+      const d=dragRef.current; if(!d) return;
+      if(!d.moved&&Math.hypot(cx-d.sc.x,cy-d.sc.y)<12) return;
+      if(e.cancelable) e.preventDefault();
+      const pt=svgPt2(cx,cy);
+      if(pt) setPos(ps=>({...ps,[d.slot]:{x:pt.x-d.ox,y:pt.y-d.oy}}));
+      const bIdx2=getBenchIdx2(cx,cy);
+      setFieldDragOver2(bIdx2);
+      setFpFieldHover(bIdx2!==null ? null : getFpFieldSlot(cx,cy,d.slot));
+      dragRef.current={...d,moved:true,clientX:cx,clientY:cy};
+      setDragL(dv=>dv?{...dv,moved:true,clientX:cx,clientY:cy}:dv);
+    }
+    function up(e){
+      const t=e.changedTouches?.[0]||e;
+      const d=dragRef.current; dragRef.current=null;
+      setFieldDragOver2(null); setFieldDrag2Ghost(null); setFpFieldHover(null);
+      window.removeEventListener('pointermove',mv);
+      window.removeEventListener('pointerup',up);
+      window.removeEventListener('touchmove',mv);
+      window.removeEventListener('touchend',up);
+      if(!d){setDragL(null);return;}
+      if(!d.moved){
+        modalOpenedAt2.current=Date.now(); setSelSlot(d.slot); setModal("player");
+        setDragL(null); return;
+      }
+      setFpFieldHover(null);
+      // Check field-to-field swap first
+      const tSlot=getFpFieldSlot(t.clientX,t.clientY,d.slot);
+      if(tSlot!==null&&field[tSlot]){
+        const startP=d.startPos;
+        setPos(ps=>{
+          const tPos=ps[tSlot]||{x:50,y:50};
+          return{...ps,[d.slot]:{...tPos},[tSlot]:{...startP}};
+        });
+        // Flip isGK for both if either was GK
+        setField(fp=>{
+          const n=[...fp];
+          if(n[d.slot]&&n[tSlot]&&(n[d.slot].isGK||n[tSlot].isGK)){
+            n[d.slot]  ={...n[d.slot],  isGK:!n[d.slot].isGK};
+            n[tSlot]   ={...n[tSlot],   isGK:!n[tSlot].isGK};
+          }
+          return n;
+        });
+        setFpBlink(d.slot); setFpBlink2(tSlot);
+        setTimeout(()=>{setFpBlink(null);setFpBlink2(null);},800);
+        setDragL(null); return;
+      }
+      const bIdx=getBenchIdx2(t.clientX,t.clientY);
+      if(bIdx!==null&&bench[bIdx]&&!bench[bIdx].ejected){
+        const outSlot=d.slot, out=field[outSlot], inP=bench[bIdx];
+        if(out&&inP){
+          setPos(ps=>({...ps,[outSlot]:d.startPos}));
+          setField(fp=>{const n=[...fp];n[outSlot]={...inP,slot:outSlot,isGK:out.isGK,shiftMs:0,totalMs:0,benchMs:0,gkMs:0,h1Ms:0,h2Ms:0};return n;});
+          setBench(bp=>bp.filter(x=>x.id!==inP.id).concat([{...out,shiftMs:0,totalMs:0,benchMs:0,gkMs:0,h1Ms:0,h2Ms:0}]));
+        }
+        setDragL(null); return;
+      }
+      // Clamp back inside field on normal drop, then optionally snap to grid
+      setPos(ps=>{
+        const c=ps[d.slot]||{x:50,y:50};
+        const cx=Math.max(20,Math.min(FIELD_W2-20,c.x));
+        const cy=Math.max(20,Math.min(FIELD_H2-20,c.y));
+        const finalPos = snapToGrid ? snapToNearestGridPoint(cx,cy,lineConfig) : {x:cx,y:cy};
+        return{...ps,[d.slot]:finalPos};
+      });
+      setDragL(null);
+    }
+    window.addEventListener('pointermove',mv,{passive:true});
+    window.addEventListener('pointerup',up);
+    window.addEventListener('touchmove',mv,{passive:false});
+    window.addEventListener('touchend',up);
+    return()=>{window.removeEventListener('pointermove',mv);window.removeEventListener('pointerup',up);window.removeEventListener('touchmove',mv);window.removeEventListener('touchend',up);};
+  },[drag,field,bench,pos,snapToGrid,lineConfig]);
+
+  function onCircleDown(e,slot){
+    e.stopPropagation(); e.preventDefault();
+    const t=e.touches?.[0]||e;
+    const p=pos[slot]||{x:50,y:50};
+    const pt=svgPt2(t.clientX,t.clientY);
+    const player=field[slot];
+    const d={slot,startPos:{...p},sc:{x:t.clientX,y:t.clientY},ox:pt?pt.x-p.x:0,oy:pt?pt.y-p.y:0,moved:false,name:player?.name||"",num:player?.num||""};
+    dragRef.current=d; setDragL({slot});
+  }
+
+  function onSVGMove(e){ if(benchDragRef2.current) onBenchMove2(e); }
+  function onSVGUp(e)  { if(benchDragRef2.current) onBenchUp2(e);  }
+
+  // ── Bench→field drag ─────────────────────────────────────────────────────────
+  function getSlotAt2(clientX, clientY) {
+    const svg = svgRef2.current; if (!svg) return null;
+    const r = svg.getBoundingClientRect();
+    const sx = ((clientX-r.left)/r.width)*FIELD_W2;
+    const sy = ((clientY-r.top)/r.height)*FIELD_H2;
+    let best=null, bestD=44;
+    field.forEach((_, slot) => {
+      const fp = pos[slot]||{x:50,y:50};
+      const d = Math.hypot(sx-fp.x, sy-fp.y);
+      if (d < bestD) { bestD=d; best=slot; }
+    });
+    return best;
+  }
+
+  function onBenchDown2(e, benchIdx) {
+    if (bench[benchIdx]?.ejected) return;
+    // DNS players: only allow tap (to open dnsAction), not drag
+    if (bench[benchIdx]?.dns) {
+      e.preventDefault(); e.stopPropagation();
+      const t = e.touches?.[0]||e;
+      // Store minimal state for tap detection only
+      benchDragRef2.current = { benchIdx, x:t.clientX, y:t.clientY,
+        startX:t.clientX, startY:t.clientY, hoverSlot:null, isDns:true };
+      setBDS2({ benchIdx, x:t.clientX, y:t.clientY, hoverSlot:null });
+      try { e.currentTarget.setPointerCapture(e.pointerId); } catch(_) {}
+      return;
+    }
+    e.preventDefault(); e.stopPropagation();
+    const t = e.touches?.[0]||e;
+    benchDragRef2.current = { benchIdx, x:t.clientX, y:t.clientY,
+      startX:t.clientX, startY:t.clientY, hoverSlot:null };
+    setBDS2({ benchIdx, x:t.clientX, y:t.clientY, hoverSlot:null });
+    try { e.currentTarget.setPointerCapture(e.pointerId); } catch(_) {}
+  }
+
+  function onBenchMove2(e) {
+    const bd = benchDragRef2.current; if (!bd) return;
+    // DNS players don't show hover highlights
+    if (bd.isDns) return;
+    if (e.cancelable) e.preventDefault();
+    const t = e.touches?.[0]||e;
+    const slot = getSlotAt2(t.clientX, t.clientY);
+    benchDragRef2.current = {...bd, x:t.clientX, y:t.clientY, hoverSlot:slot};
+    setBDS2({ benchIdx:bd.benchIdx, x:t.clientX, y:t.clientY, hoverSlot:slot });
+  }
+
+  function onBenchUp2(e) {
+    const bd = benchDragRef2.current;
+    benchDragRef2.current = null; setBDS2(null);
+    if (!bd) return;
+    const t = e.changedTouches?.[0]||e;
+    // Tap detection: open modal
+    const moved = Math.hypot(t.clientX-(bd.startX||bd.x), t.clientY-(bd.startY||bd.y));
+    if (moved < 12) {
+      modalOpenedAt2.current = Date.now();
+      setSelSlot(bd.benchIdx);
+      setModal(bench[bd.benchIdx]?.dns ? "dnsAction" : "benchAction");
+      return;
+    }
+    // DNS players cannot be dragged to field
+    if (bd.isDns || bench[bd.benchIdx]?.dns) return;
+    const slot = getSlotAt2(t.clientX, t.clientY);
+    if (slot === null) return;
+    const benchP = bench[bd.benchIdx];
+    const out = field[slot];
+    if (!benchP || !out) return;
+    // Swap bench player into slot, field player goes to bench
+    setField(fp => { const n=[...fp]; n[slot]={...benchP,slot,isGK:out.isGK,shiftMs:0,totalMs:0,benchMs:0,gkMs:0,h1Ms:0,h2Ms:0}; return n; });
+    setBench(bp => bp.filter(x=>x.id!==benchP.id).concat([{...out,shiftMs:0,totalMs:0,benchMs:0,gkMs:0,h1Ms:0,h2Ms:0}]));
+  }
+
+  useEffect(() => {
+    if (!benchDragState2) return;
+    function handleBenchMove2(e) { onBenchMove2(e); }
+    function handleBenchUp2(e) { onBenchUp2(e); }
+    window.addEventListener('pointermove', handleBenchMove2);
+    window.addEventListener('pointerup', handleBenchUp2);
+    window.addEventListener('touchmove', handleBenchMove2, { passive:false });
+    window.addEventListener('touchend', handleBenchUp2);
+    return () => {
+      window.removeEventListener('pointermove', handleBenchMove2);
+      window.removeEventListener('pointerup', handleBenchUp2);
+      window.removeEventListener('touchmove', handleBenchMove2);
+      window.removeEventListener('touchend', handleBenchUp2);
+    };
+  }, [benchDragState2, field, bench, pos]);
+
+  // ── Swap via modal (tap player → pick from bench list) ───────────────────────
+  // FIX: capture the slot at the time the button is tapped, don't rely on async state
+  function doSwap(outSlot, benchP) {
+    const out = field[outSlot];
+    if (!out) return;
+    setField(fp => { const n=[...fp]; n[outSlot]={...benchP,slot:outSlot,isGK:out.isGK,shiftMs:0,totalMs:0,benchMs:0,gkMs:0,h1Ms:0,h2Ms:0}; return n; });
+    setBench(bp => bp.filter(x=>x.id!==benchP.id).concat([{...out,shiftMs:0,totalMs:0,benchMs:0,gkMs:0,h1Ms:0,h2Ms:0}]));
+    setModal(null); setSelSlot(null);
+  }
+
+  function toggleGK2(slot) {
+    setField(fp => fp.map((p,i) => ({...p, isGK: i===slot ? !p.isGK : false})));
+    setModal(null); setSelSlot(null);
+  }
+
+  function safeClick2(fn) { return () => { if (Date.now()-modalOpenedAt2.current < 350) return; fn(); }; }
+
+  const selP = selSlot !== null ? field[selSlot] : null;
+  const label = which==="h1" ? "1st Half Formation" : "2nd Half Formation";
+  const accentCol = which==="h1" ? "#3b82f6" : "#22c55e";
+  const circleCol = which==="h1" ? "#1e3a8a" : "#14532d";
+  const strokeCol = which==="h1" ? "#60a5fa" : "#4ade80";
+  const textCol   = which==="h1" ? "#93c5fd" : "#86efac";
+
+  return (
+    <div style={{fontFamily:"system-ui,sans-serif",background:"#071120",height:"100dvh",maxHeight:"100dvh",color:"#fff",display:"flex",flexDirection:"column",userSelect:"none",maxWidth:480,margin:"0 auto",overflowY:"auto",WebkitOverflowScrolling:"touch",overscrollBehavior:"contain"}}
+      onPointerMove={e => { if(benchDragRef2.current) onBenchMove2(e); }}
+      onPointerUp={e => { if(benchDragRef2.current) onBenchUp2(e); }}
+      onPointerCancel={() => { benchDragRef2.current=null; setBDS2(null); }}
+    >
+      {/* Header — just the title and hint */}
+      <div style={{background:"#0d1f3c",borderBottom:"1px solid #1e3a5f",flexShrink:0,padding:"7px 10px 6px"}}>
+        <span style={{fontSize:14,color:accentCol,fontWeight:800}}>{label}</span>
+        <div style={{fontSize:10,color:"#4a6a8a",marginTop:2}}>
+          Drag to arrange · Drag bench↔field to swap · Tap to assign GK
+        </div>
+      </div>
+
+      {/* Field */}
+      <div style={{flex:"1 1 280px",display:"flex",justifyContent:"center",padding:"2px 4px 0",overflow:"hidden",minHeight:260}}>
+        <svg ref={svgRef2} viewBox={`0 0 ${FIELD_W2} ${FIELD_H2}`}
+          style={{width:"100%",maxWidth:440,height:"100%",maxHeight:"100%",touchAction:"pan-y",cursor:"default",overflow:"visible"}}
+          onPointerMove={onSVGMove} onPointerUp={onSVGUp} onPointerCancel={onSVGUp}
+        >
+          <rect width={FIELD_W2} height={FIELD_H2} fill="#1a4a2a" rx="8"/>
+          <rect x={8} y={8} width={FIELD_W2-16} height={FIELD_H2-16} fill="none" stroke="#2d7a45" strokeWidth="1.5" rx="5"/>
+          <line x1={8} y1={FIELD_H2/2} x2={FIELD_W2-8} y2={FIELD_H2/2} stroke="#2d7a45" strokeWidth="1"/>
+          <circle cx={FIELD_W2/2} cy={FIELD_H2/2} r={36} fill="none" stroke="#2d7a45" strokeWidth="1"/>
+          <rect x={FIELD_W2/2-55} y={8} width={110} height={73} fill="none" stroke="#2d7a45" strokeWidth="1"/>
+          <rect x={FIELD_W2/2-55} y={FIELD_H2-81} width={110} height={73} fill="none" stroke="#2d7a45" strokeWidth="1"/>
+          <rect x={FIELD_W2/2-25} y={1} width={50} height={10} fill="none" stroke="#3da05a" strokeWidth="1.5"/>
+          <rect x={FIELD_W2/2-25} y={FIELD_H2-11} width={50} height={10} fill="none" stroke="#3da05a" strokeWidth="1.5"/>
+
+          {/* Grid points overlay */}
+          {showGrid && gridPoints(lineConfig).map((pt, i) => (
+            <g key={"gp"+i}>
+              <circle cx={pt.x} cy={pt.y} r={6} fill="none" stroke="rgba(255,255,255,0.25)" strokeWidth="1.5"/>
+              <circle cx={pt.x} cy={pt.y} r={1.5} fill="rgba(255,255,255,0.35)"/>
+            </g>
+          ))}
+
+          {/* +/- row buttons — one per non-GK line (lineConfig rows 0-3) */}
+          {lineConfig && lineConfig.map((count, li) => {
+            // li=0→defenders(row1), li=1→def-mid(row2), li=2→att-mid(row3), li=3→forwards(row4)
+            // Row y: row 0=GK at bottom, row 4=fwd at top; total 5 rows
+            const numRows = 5;
+            const rowIdx = li + 1; // skip GK row
+            const t = rowIdx / (numRows - 1);
+            const yTop = 44, yBottom = FIELD_H2 - 44;
+            const y = yBottom - t * (yBottom - yTop);
+            const btnR = 11;
+            const canAdd = count < 5;
+            const canSub = count > 1;
+            return (
+              <g key={"linebtn"+li}>
+                {/* Minus button — left side */}
+                <circle cx={18} cy={y} r={btnR} fill={canSub?"#1e3a5f":"#0d1f3c"} stroke={canSub?"#4a7fc1":"#1e3a5f"} strokeWidth="1.5"
+                  style={{cursor:canSub?"pointer":"default"}}
+                  onClick={e=>{ e.stopPropagation(); if(!canSub) return;
+                    const next = lineConfig.map((v,i)=>i===li?v-1:v);
+                    setLineConfig(next);
+                  }}
+                />
+                <text x={18} y={y+4.5} textAnchor="middle" fontSize="14" fontWeight="800"
+                  fill={canSub?"#93c5fd":"#2a4a6a"} style={{pointerEvents:"none",userSelect:"none"}}>−</text>
+
+                {/* Count label */}
+                <text x={FIELD_W2/2} y={y-16} textAnchor="middle" fontSize="9" fill="rgba(255,255,255,0.35)"
+                  style={{pointerEvents:"none",userSelect:"none"}}>
+                  {["DEF","DM","AM","FWD"][li]} {count}
+                </text>
+
+                {/* Plus button — right side */}
+                <circle cx={FIELD_W2-18} cy={y} r={btnR} fill={canAdd?"#1e3a5f":"#0d1f3c"} stroke={canAdd?"#4a7fc1":"#1e3a5f"} strokeWidth="1.5"
+                  style={{cursor:canAdd?"pointer":"default"}}
+                  onClick={e=>{ e.stopPropagation(); if(!canAdd) return;
+                    const next = lineConfig.map((v,i)=>i===li?v+1:v);
+                    setLineConfig(next);
+                  }}
+                />
+                <text x={FIELD_W2-18} y={y+4.5} textAnchor="middle" fontSize="14" fontWeight="800"
+                  fill={canAdd?"#93c5fd":"#2a4a6a"} style={{pointerEvents:"none",userSelect:"none"}}>+</text>
+              </g>
+            );
+          })}
+
+          {field.map((player, slot) => {
+            if (drag?.moved && slot === drag.slot) return null; // rendered last
+            const p = pos[slot] || {x:50,y:50};
+            const isSel = selSlot===slot;
+            const isHover = benchDragState2?.hoverSlot===slot;
+            const nm = player.name.length>10 ? player.name.slice(0,9)+"…" : player.name;
+            const numLabel = showJerseyNum && player.num ? " #"+player.num : "";
+            return (
+              <g key={player.id} onPointerDown={e=>onCircleDown(e,slot)} style={{cursor:"grab",touchAction:"none"}}>
+                <circle cx={p.x} cy={p.y} r={40} fill="transparent" stroke="none"/>
+                {/* Bench hover highlight */}
+                {isHover && <circle cx={p.x} cy={p.y} r={34} fill="none" stroke="#4ade80" strokeWidth="3" strokeDasharray="6 3"/>}
+                {/* Field-to-field swap hover */}
+                {fpFieldHover===slot && drag?.moved && (
+                  <circle cx={p.x} cy={p.y} r={34} fill="none" stroke="#f59e0b" strokeWidth="3" strokeDasharray="6 3"/>
+                )}
+                {/* Swap blink */}
+                {(fpBlink===slot||fpBlink2===slot) && (
+                  <circle cx={p.x} cy={p.y} r={34} fill="none" stroke="#4ade80" strokeWidth="4"
+                    style={{animation:"subBlink 0.4s ease-in-out 2"}}/>
+                )}
+                {player.isGK && <circle cx={p.x} cy={p.y} r={35} fill="none" stroke="#fbbf24" strokeWidth="3" strokeDasharray="6 3"/>}
+                <circle cx={p.x} cy={p.y} r={29}
+                  fill={isHover?"#14532d":isSel?"#1e40af":circleCol}
+                  stroke={isHover?"#4ade80":isSel?"#93c5fd":strokeCol}
+                  strokeWidth={isSel||isHover?3:2}
+                />
+                <text x={p.x} y={p.y+2} textAnchor="middle" dominantBaseline="middle" fontSize="12" fill="#fff" fontWeight="700">{nm}</text>
+                {showJerseyNum && player.num && <text x={p.x} y={p.y+16} textAnchor="middle" fontSize="9" fill={textCol}>#{player.num}</text>}
+                {player.isGK && <text x={p.x} y={p.y-18} textAnchor="middle" fontSize="8" fill="#fbbf24" fontWeight="700">GK</text>}
+              </g>
+            );
+          })}
+
+        </svg>
+      </div>
+
+      {/* Bench — drag from field or from bench onto field */}
+      <div ref={benchContRef2} style={{padding:"5px 10px 6px",background:"#050e1e",borderTop:"1px solid #0d1f3c",flexShrink:0}}>
+        <div style={{fontSize:9,color:"#4a6a8a",marginBottom:5,fontWeight:700,letterSpacing:1}}>BENCH — drag to/from field to swap positions</div>
+        <div style={{display:"flex",gap:4,flexWrap:"wrap"}}>
+          {[...bench].sort((a,b)=>a.ejected&&!b.ejected?1:!a.ejected&&b.ejected?-1:0).map((p, bi) => {
+            const origIdx = bench.findIndex(x=>x.id===p.id);
+            const isDragging = benchDragState2?.benchIdx===origIdx;
+            const isTargeted = fieldDragOver2===origIdx;
+            const nm = p.name.length>8 ? p.name.slice(0,7)+"…" : p.name;
+            return (
+              <div key={p.id}
+                data-benchidx2={origIdx}
+                onPointerDown={e=>onBenchDown2(e, origIdx)}
+                style={{display:"flex",flexDirection:"column",alignItems:"center",gap:2,cursor:"grab",touchAction:"none",opacity:isDragging?0.35:1}}
+              >
+                <svg width="58" height="58" viewBox="0 0 58 58">
+                  {isTargeted&&<circle cx={29} cy={29} r={28} fill="none" stroke="#4ade80" strokeWidth="2.5" strokeDasharray="5 3"/>}
+                  <circle cx={29} cy={29} r={25}
+                    fill={isTargeted?"#14532d":p.dns?"#1a1a0a":"#1e3a5f"}
+                    stroke={isDragging?"#60a5fa":isTargeted?"#4ade80":p.dns?"#a16207":"#2d5a8f"}
+                    strokeWidth={isDragging||isTargeted?2.5:1.5}/>
+                  {p.dns
+                    ? <text x={29} y={29} textAnchor="middle" dominantBaseline="middle" fontSize="10" fill="#a16207" fontWeight="700">{p.num||"?"}</text>
+                    : <text x={29} y={29} textAnchor="middle" dominantBaseline="middle" fontSize="12" fill="#93c5fd" fontWeight="600">{nm}</text>
+                  }
+                  {!p.dns&&showJerseyNum&&p.num&&<text x={29} y={43} textAnchor="middle" fontSize="9" fill="#60a5fa">#{p.num}</text>}
+                </svg>
+              </div>
+            );
+          })}
+          {bench.length===0 && <span style={{fontSize:11,color:"#4a6a8a"}}>No bench players</span>}
+        </div>
+      </div>
+
+      {/* Field drag portal ghost — fixed position, always in front */}
+      {drag?.moved && field[drag.slot] && dragRef.current?.clientX !== undefined && (()=>{
+        const d = dragRef.current;
+        const player = field[d.slot];
+        if (!player) return null;
+        const nm = player.name.length>8?player.name.slice(0,7)+"…":player.name;
+        return (
+          <div style={{position:"fixed",left:d.clientX-32,top:d.clientY-36,width:64,height:64,pointerEvents:"none",zIndex:9999}}>
+            <svg width="64" height="64" viewBox="0 0 64 64">
+              {player.isGK&&<circle cx={32} cy={32} r={31} fill="none" stroke="#fbbf24" strokeWidth="2.5" strokeDasharray="5 3"/>}
+              <circle cx={32} cy={32} r={30} fill={which==="h1"?"#1e3a8a":"#14532d"} stroke={which==="h1"?"#60a5fa":"#4ade80"} strokeWidth="3"/>
+              <text x={32} y={32} textAnchor="middle" dominantBaseline="middle" fontSize="12" fill="#fff" fontWeight="700">{nm}</text>
+            </svg>
+            <div style={{position:"absolute",bottom:-14,left:"50%",transform:"translateX(-50%)",fontSize:9,color:"#e2e8f0",whiteSpace:"nowrap",fontWeight:500}}>{nm}</div>
+          </div>
+        );
+      })()}
+
+      {/* Bench drag ghost */}
+      {benchDragState2 && bench[benchDragState2.benchIdx] && (()=>{
+        const bp = bench[benchDragState2.benchIdx];
+        const nm = bp.name.length>8?bp.name.slice(0,7)+"…":bp.name;
+        return (
+          <div style={{position:"fixed",left:benchDragState2.x-32,top:benchDragState2.y-52,width:64,height:64,pointerEvents:"none",zIndex:200,opacity:0.92}}>
+            <svg width="64" height="64" viewBox="0 0 64 64">
+              <circle cx={32} cy={32} r={28} fill="#1d4ed8" stroke="#93c5fd" strokeWidth="2.5"/>
+              <text x={32} y={32} textAnchor="middle" dominantBaseline="middle" fontSize="12" fill="#fff" fontWeight="700">{nm}</text>
+            </svg>
+          </div>
+        );
+      })()}
+
+      {/* Bottom bar: Start (h1 only, left) + navigation (right) */}
+      <div style={{padding:"8px 10px",background:"#0d1f3c",borderTop:"1px solid #1e3a5f",display:"flex",alignItems:"center",gap:8,flexShrink:0}}>
+        {!isH2 && (
+          <button onClick={()=>{ onSave(); onLaunch(); }}
+            style={{padding:"10px 16px",borderRadius:10,border:"none",background:"#15803d",
+              color:"#fff",fontWeight:700,fontSize:13,cursor:"pointer",flexShrink:0}}>
+            ▶ Start
+          </button>
+        )}
+        <div style={{flex:1}}/>
+        <button onClick={()=>{ onSave(); onOther(); }}
+          style={{padding:"10px 14px",borderRadius:10,border:"1px solid #1e3a5f",
+            background:"#071120",color:"#7aa0cc",fontWeight:600,fontSize:13,cursor:"pointer"}}>
+          {otherLabel}
+        </button>
+        <button onClick={()=>{ onSave(); onMenu(); }}
+          style={{padding:"10px 14px",borderRadius:10,border:"1px solid #1e3a5f",
+            background:"#071120",color:"#7aa0cc",fontWeight:600,fontSize:13,cursor:"pointer"}}>
+          Menu
+        </button>
+      </div>
+
+      {/* DNS player tap modal */}
+      {modal==="dnsAction" && selSlot!==null && bench[selSlot] && (()=>{
+        const bp = bench[selSlot];
+        return (
+          <div style={S.overlay} onClick={safeClick2(()=>{setModal(null);setSelSlot(null);})}>
+            <div style={S.card} onClick={e=>e.stopPropagation()}>
+              <div style={{fontWeight:800,fontSize:17,color:"#fff"}}>{bp.num?`#${bp.num} `:""}{bp.name}</div>
+              <div style={{fontSize:12,color:"#f59e0b",marginBottom:6}}>🚫 Did Not Show</div>
+              <div style={{fontSize:11,color:"#4a6a8a",marginBottom:14}}>Mark this player as arrived to include them in the formation.</div>
+              <button onClick={safeClick2(()=>{
+                setBench(bx=>bx.map(b=>b.id===bp.id?{...b,dns:false}:b));
+                setModal(null);setSelSlot(null);
+              })} style={{...B.act("#15803d","#86efac"),marginBottom:8,textAlign:"center"}}>✅ Mark as Arrived</button>
+              <button onClick={safeClick2(()=>{setModal(null);setSelSlot(null);})} style={B.cancel()}>Cancel</button>
+            </div>
+          </div>
+        );
+      })()}
+
+      {modal==="benchAction" && selSlot!==null && bench[selSlot] && (()=>{
+        const bp = bench[selSlot];
+        return (
+          <div style={S.overlay} onClick={safeClick2(()=>{setModal(null);setSelSlot(null);})}>
+            <div style={S.card} onClick={e=>e.stopPropagation()}>
+              <div style={{fontWeight:800,fontSize:16,color:"#fff",marginBottom:4}}>
+                {bp.num?`#${bp.num} `:""}{bp.name}
+              </div>
+              <div style={{fontSize:11,color:"#7aa0cc",marginBottom:12}}>On bench</div>
+              <div style={{display:"flex",flexDirection:"column",gap:8}}>
+                <button onClick={safeClick2(()=>{
+                  setBench(bx=>bx.map(b=>b.id===bp.id?{...b,dns:true}:b));
+                  setModal(null);setSelSlot(null);
+                })} style={B.act("#78350f","#fcd34d")}>
+                  🚫 Mark Did Not Show
+                </button>
+              </div>
+              <button onClick={safeClick2(()=>{setModal(null);setSelSlot(null);})} style={B.cancel()}>Cancel</button>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* Player tap modal: assign GK or swap with bench */}
+      {modal==="player" && selP && (
+        <div style={S.overlay} onClick={safeClick2(()=>{setModal(null);setSelSlot(null);})}>
+          <div style={S.card} onClick={e=>e.stopPropagation()}>
+            <div style={{fontWeight:800,fontSize:16,color:"#fff",marginBottom:4}}>{selP.num?`#${selP.num} `:""}{selP.name}</div>
+            <div style={{fontSize:11,color:"#7aa0cc",marginBottom:12}}>{selP.isGK?"★ Currently assigned as GK":""}</div>
+            <div style={{display:"flex",flexDirection:"column",gap:7}}>
+              <button onClick={safeClick2(()=>toggleGK2(selSlot))} style={B.act("#7c3aed","#c4b5fd")}>
+                {selP.isGK?"★ Remove GK marker":"★ Assign as Goalkeeper"}
+              </button>
+              {bench.filter(p=>!p.dns&&!p.ejected).length>0 && <>
+                <div style={{fontSize:11,color:"#4a6a8a",margin:"4px 0 2px"}}>Swap with bench player:</div>
+                {bench.filter(p=>!p.dns&&!p.ejected).map(p=>(
+                  <button key={p.id}
+                    onClick={safeClick2(()=>doSwap(selSlot, p))}
+                    style={{...B.act("#1d4ed8","#93c5fd"),display:"flex",justifyContent:"space-between"}}>
+                    <span>{p.num?`#${p.num} `:""}{p.name}</span>
+                  </button>
+                ))}
+              </>}
+            </div>
+            <button onClick={safeClick2(()=>{setModal(null);setSelSlot(null);})} style={B.cancel()}>Cancel</button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+// ── Summary Screen ────────────────────────────────────────────────────────────
+function Summary({ field, bench, events, score, goals, gameMs, teamName, opponent, gameDate, teamSize, competition, statsSaved, onSaveStats, onBack }) {
+  const [confirmSave, setConfirmSave] = useState(!statsSaved);
+  const [exportedCsv, setExportedCsv] = useState(false);
+  const exportedCsvRef = useRef(false);
+
+  function exportGameStats() {
+    const now = new Date();
+    const dateStr = gameDate || now.toLocaleDateString();
+    const timeStr = now.toLocaleTimeString([], {hour:"2-digit",minute:"2-digit"});
+    const oppStr = opponent || "Unknown";
+
+    // Build CSV content
+    const esc = v => `"${String(v).replace(/"/g,'""')}"`;
+    const rows = [];
+
+    // Section 1: Game Info
+    rows.push(["GAME SUMMARY"]);
+    rows.push(["Date", dateStr]);
+    rows.push(["Time", timeStr]);
+    rows.push(["Team", teamName]);
+    rows.push(["Opponent", oppStr]);
+    rows.push(["Score", score.us + " - " + score.them]);
+    rows.push(["Format", teamSize + "v" + teamSize]);
+    rows.push(["Total Time", fmt(gameMs)]);
+    rows.push([]);
+
+    // Section 2: Player Stats
+    rows.push(["PLAYER STATISTICS"]);
+    rows.push(["#", "Name", "Status", "Time Played", "1st Half", "2nd Half", "GK Time", "Bench Time", "Goals", "Cards"]);
+
+    // Collect card events per player name
+    const cardMap = {};
+    events.forEach(ev => {
+      const m = ev.text.match(/^(YELLOW|RED) CARD: (.+)$/i);
+      if (m) {
+        const key = m[2].trim();
+        if (!cardMap[key]) cardMap[key] = [];
+        cardMap[key].push(m[1].toUpperCase());
+      }
+    });
+
+    const allPlayers = [
+      ...field.map(p=>({...p, status:"Field"})),
+      ...bench.map(p=>({...p, status: p.ejected ? "Ejected" : "Bench"}))
+    ].sort((a,b)=>(b.totalMs||0)-(a.totalMs||0));
+
+    allPlayers.forEach(p => {
+      const g = goals[p.id] || 0;
+      const nameKey = (p.num ? "#"+p.num+" " : "") + p.name;
+      const cards = (cardMap[nameKey] || []).join(", ") || "";
+      rows.push([
+        p.num || "",
+        p.name,
+        p.status + (p.isGK ? " (GK)" : ""),
+        fmtS(p.totalMs),
+        fmtS(p.h1Ms || 0),
+        fmtS(p.h2Ms || 0),
+        p.gkMs > 0 ? fmtS(p.gkMs) : "",
+        fmtS(p.benchMs || 0),
+        g || 0,
+        cards
+      ]);
+    });
+    rows.push([]);
+
+    // Section 3: Goals scored
+    rows.push(["GOALS"]);
+    rows.push(["Time", "Event"]);
+    events.filter(ev=>ev.text.includes("GOAL")).forEach(ev=>{
+      rows.push([ev.time, ev.text]);
+    });
+    rows.push([]);
+
+    // Section 4: Full event log
+    rows.push(["EVENT LOG"]);
+    rows.push(["Time", "Event"]);
+    events.forEach(ev => rows.push([ev.time, ev.text]));
+
+    const csv = rows.map(r => r.map(esc).join(",")).join("\r\n");
+    const bom = "\uFEFF"; // UTF-8 BOM so Excel opens it correctly
+    const blob = new Blob([bom + csv], {type:"text/csv;charset=utf-8;"});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    const safeName = (teamName + "_vs_" + oppStr + "_" + dateStr).replace(/[^a-z0-9_\-]/gi,"_");
+    a.href = url; a.download = safeName + ".csv"; a.click();
+    URL.revokeObjectURL(url);
+    exportedCsvRef.current = true;
+    setExportedCsv(true);
+  }
+
+  function returnToSetup(saveStats=false) {
+    if (saveStats) onSaveStats();
+    if (!exportedCsvRef.current) {
+      const shouldExport = window.confirm("Export this game to CSV before returning to setup?");
+      if (shouldExport) exportGameStats();
+    }
+    setConfirmSave(false);
+    onBack();
+  }
+
+  function requestMenuReturn() {
+    if (confirmSave && !statsSaved) {
+      const saveStats = window.confirm("Save this game's player stats before returning to setup?");
+      returnToSetup(saveStats);
+      return;
+    }
+    returnToSetup(false);
+  }
+
+  const [sortBy, setSort] = useState("totalMs");
+  const all = [
+    ...field.map(p=>({...p, onBench:false})),
+    ...bench.map(p=>({...p, onBench:true})),
+  ].sort((a,b) => {
+    if (sortBy==="totalMs") return (b.totalMs||0)-(a.totalMs||0);
+    if (sortBy==="benchMs") return (b.benchMs||0)-(a.benchMs||0);
+    if (sortBy==="goals")   return (goals[b.id]||0)-(goals[a.id]||0);
+    return 0;
+  });
+
+  return (
+    <div style={{fontFamily:"system-ui,sans-serif",background:"#071120",height:"100dvh",overflowY:"auto",WebkitOverflowScrolling:"touch",overscrollBehavior:"contain",color:"#fff",padding:"16px 14px",paddingBottom:"calc(18px + env(safe-area-inset-bottom))",maxWidth:480,margin:"0 auto"}}>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:8,marginBottom:14}}>
+        <div style={{display:"flex",alignItems:"center",gap:8}}>
+          <span style={{fontSize:20}}>📊</span>
+          <span style={{fontSize:18,fontWeight:800,color:"#60a5fa"}}>Game Summary</span>
+        </div>
+        <div style={{display:"flex",gap:6,flexShrink:0}}>
+          <button onClick={exportGameStats} style={{background:exportedCsv?"#166534":"#15803d",border:"none",color:"#bbf7d0",padding:"7px 10px",borderRadius:8,fontSize:12,fontWeight:700,cursor:"pointer"}}>{exportedCsv?"✓ Exported":"⬇ Export CSV"}</button>
+          <button onClick={requestMenuReturn} style={{background:"#1d4ed8",border:"none",color:"#dbeafe",padding:"7px 10px",borderRadius:8,fontSize:12,fontWeight:700,cursor:"pointer"}}>Menu</button>
+        </div>
+      </div>
+
+      <div style={{background:"#0d1f3c",borderRadius:12,padding:"12px",marginBottom:14}}>
+        <div style={{display:"flex",justifyContent:"space-around",alignItems:"center",marginBottom:8}}>
+          <div style={{textAlign:"center"}}>
+            <div style={{fontSize:38,fontWeight:800}}>{score.us}</div>
+            <div style={{fontSize:11,color:"#7aa0cc"}}>{teamName}</div>
+          </div>
+          <div style={{fontSize:11,color:"#4a6a8a",textAlign:"center"}}>
+            <div style={{fontSize:13,fontWeight:600}}>{fmt(gameMs)}</div>
+            <div>total time</div>
+          </div>
+          <div style={{textAlign:"center"}}>
+            <div style={{fontSize:38,fontWeight:800}}>{score.them}</div>
+            <div style={{fontSize:11,color:"#7aa0cc"}}>{opponent||"Opponent"}</div>
+          </div>
+        </div>
+        <div style={{borderTop:"1px solid #1e3a5f",paddingTop:8,display:"flex",justifyContent:"space-between",fontSize:11,color:"#4a6a8a"}}>
+          <span>📅 {gameDate || new Date().toLocaleDateString()}</span>
+          <span>{teamSize}v{teamSize}</span>
+          {opponent && <span>vs {opponent}</span>}
+        </div>
+      </div>
+
+      {/* Sort */}
+      <div style={{display:"flex",gap:6,marginBottom:10,alignItems:"center"}}>
+        <span style={{fontSize:10,color:"#4a6a8a",marginRight:2}}>Sort:</span>
+        {[["totalMs","⏱ Played"],["benchMs","🪑 Bench"],["goals","⚽ Goals"]].map(([k,l])=>(
+          <button key={k} onClick={()=>setSort(k)} style={{flex:1,padding:"6px 0",borderRadius:8,border:sortBy===k?"2px solid #3b82f6":"1px solid #1e3a5f",background:sortBy===k?"#1d4ed8":"#0d1f3c",color:sortBy===k?"#fff":"#7aa0cc",fontWeight:600,fontSize:11,cursor:"pointer"}}>{l}</button>
+        ))}
+      </div>
+
+      {/* Table */}
+      <div style={{background:"#0d1f3c",borderRadius:12,overflow:"hidden",marginBottom:14}}>
+        <div style={{display:"grid",gridTemplateColumns:"28px 1fr 58px 58px 36px",gap:3,padding:"7px 10px",background:"#1e3a5f",fontSize:10,color:"#4a6a8a",fontWeight:700,letterSpacing:0.3}}>
+          <span>#</span><span>Player</span>
+          <span style={{textAlign:"right",color:sortBy==="totalMs"?"#60a5fa":undefined}}>Played</span>
+          <span style={{textAlign:"right",color:"#fbbf24"}}>GK</span>
+          <span style={{textAlign:"right",color:sortBy==="benchMs"?"#f87171":undefined}}>Bench</span>
+          <span style={{textAlign:"right",color:sortBy==="goals"?"#f59e0b":undefined}}>⚽</span>
+        </div>
+        {all.length===0 && <div style={{padding:"12px 10px",color:"#4a6a8a",fontSize:13}}>No players</div>}
+        {all.map((p,i)=>{
+          const g=goals[p.id]||0;
+          return (
+            <div key={p.id} style={{display:"grid",gridTemplateColumns:"28px 1fr 52px 46px 52px 32px",gap:3,padding:"8px 10px",borderTop:i>0?"1px solid #1e3a5f":"none",alignItems:"center"}}>
+              <span style={{fontSize:11,color:"#60a5fa",fontWeight:700}}>{p.num||"—"}</span>
+              <div style={{overflow:"hidden"}}>
+                <div style={{fontSize:13,color:p.ejected?"#fca5a5":p.onBench?"#4a6a8a":"#e2e8f0",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{p.name}{p.isGK?<span style={{color:"#fbbf24",fontSize:9,marginLeft:4}}>GK</span>:""}{p.ejected?<span style={{color:"#fca5a5",fontSize:9,marginLeft:4}}>🟥 ejected</span>:""}</div>
+                {p.onBench && !p.ejected && <div style={{fontSize:9,color:"#4a6a8a"}}>bench</div>}
+              </div>
+              <span style={{fontSize:12,color:"#4ade80",textAlign:"right",fontVariantNumeric:"tabular-nums"}}>{fmtS(p.totalMs)}</span>
+              <span style={{fontSize:11,color:(p.gkMs||0)>0?"#fbbf24":"#1e3a5f",textAlign:"right",fontVariantNumeric:"tabular-nums"}}>{(p.gkMs||0)>0?fmtS(p.gkMs):"—"}</span>
+              <span style={{fontSize:12,color:"#f87171",textAlign:"right",fontVariantNumeric:"tabular-nums"}}>{fmtS(p.benchMs||0)}</span>
+              <span style={{fontSize:13,color:g>0?"#f59e0b":"#4a6a8a",textAlign:"right",fontWeight:g>0?700:400}}>{g||"—"}</span>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Events */}
+      <div style={{marginBottom:16}}>
+        <div style={{fontSize:10,color:"#4a6a8a",fontWeight:700,letterSpacing:1,marginBottom:7}}>EVENTS</div>
+        <div style={{maxHeight:220,overflowY:"auto",WebkitOverflowScrolling:"touch",overscrollBehavior:"contain",background:"#0d1f3c",border:"1px solid #1e3a5f",borderRadius:10,padding:"4px 8px"}}>
+          {events.length===0 && <div style={{fontSize:12,padding:"8px 0",color:"#4a6a8a"}}>No events recorded</div>}
+          {events.map((ev,i)=>(
+            <div key={i} style={{fontSize:12,padding:"5px 0",borderBottom:i<events.length-1?"1px solid #1e3a5f":"none",color:"#93c5fd"}}>
+              <span style={{color:"#4a6a8a",marginRight:8}}>{ev.time}</span>{ev.text}
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {confirmSave ? (
+        <div style={{background:"#0d1f3c",borderRadius:12,padding:"14px",marginTop:8}}>
+          <div style={{fontSize:14,color:"#fff",fontWeight:700,marginBottom:6}}>End Game — save stats?</div>
+          <div style={{fontSize:11,color:"#7aa0cc",marginBottom:12}}>Add each player's minutes, goals and cards to their career totals?</div>
+          <button onClick={()=>returnToSetup(true)} style={{width:"100%",padding:"12px",borderRadius:10,border:"none",background:"#15803d",color:"#fff",fontWeight:700,fontSize:14,cursor:"pointer",marginBottom:8}}>✓ Save stats &amp; end</button>
+          <button onClick={()=>returnToSetup(false)} style={{width:"100%",padding:"12px",borderRadius:10,border:"none",background:"#7f1d1d",color:"#fca5a5",fontWeight:700,fontSize:14,cursor:"pointer"}}>✗ End without saving</button>
+        </div>
+      ) : (
+        <button onClick={()=>returnToSetup(false)} style={{width:"100%",padding:"13px",borderRadius:12,background:"#1d4ed8",border:"none",color:"#fff",fontWeight:700,fontSize:15,cursor:"pointer"}}>🏁 End Game &amp; Return to Setup</button>
+      )}
+    </div>
+  );
+}
+
+// ── Shared styles ─────────────────────────────────────────────────────────────
+const S = {
+  root:     { fontFamily:"system-ui,sans-serif", background:"#071120", height:"100%", color:"#fff", display:"flex", flexDirection:"column", userSelect:"none", maxWidth:480, margin:"0 auto", overflow:"hidden" },
+  header:   { display:"flex", alignItems:"center", justifyContent:"space-between", padding:"5px 12px", background:"#0d1f3c", borderBottom:"1px solid #1e3a5f", flexShrink:0 },
+  overlay:  { position:"fixed", inset:0, background:"rgba(0,0,0,0.82)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:100, padding:16 },
+  card:     { background:"#0d1f3c", borderRadius:16, padding:"18px 16px", width:"100%", maxWidth:340, border:"1px solid #1e3a5f" },
+};
+
+const B = {
+  sm:     (bg,c) => ({ background:bg, border:"none", color:c, padding:"5px 10px", borderRadius:7, fontSize:11, fontWeight:600, cursor:"pointer" }),
+  smFull: (bg,c) => ({ background:bg, border:"1px solid #1e3a5f", color:c, padding:"9px 0", borderRadius:9, fontSize:12, fontWeight:600, cursor:"pointer" }),
+  ctrl:   (bg,c,bold=false) => ({ background:bg, border:"none", color:c, padding:"8px 14px", borderRadius:8, fontSize:13, fontWeight:bold?700:600, cursor:"pointer" }),
+  ctrlCompact: (bg,c,bold=false) => ({ background:bg, border:"none", color:c, width:54, padding:"7px 0", borderRadius:7, fontSize:11, fontWeight:bold?700:600, cursor:"pointer", whiteSpace:"nowrap", lineHeight:1.1, flex:"0 0 54px", textAlign:"center" }),
+  act:    (bg,c) => ({ background:bg, border:"none", color:c, padding:"10px 14px", borderRadius:9, fontSize:13, fontWeight:600, cursor:"pointer", width:"100%", textAlign:"left" }),
+  cancel: ()     => ({ marginTop:12, width:"100%", padding:"7px", background:"transparent", border:"1px solid #1e3a5f", borderRadius:8, color:"#7aa0cc", cursor:"pointer", fontSize:13 }),
+  inp:    ()     => ({ width:"100%", padding:"10px 12px", borderRadius:9, background:"#0d1f3c", border:"1px solid #1e3a5f", color:"#fff", fontSize:14, marginBottom:12, boxSizing:"border-box", outline:"none" }),
+  lbl:    ()     => ({ display:"block", fontSize:10, color:"#4a6a8a", fontWeight:700, letterSpacing:1, marginBottom:6 }),
+};
+
+ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(React.StrictMode, null, React.createElement(App)));
+</script>
+<script>
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", function() {
+    navigator.serviceWorker.register("./service-worker.js").catch(function(err) {
+      console.warn("Service worker registration failed", err);
+    });
+  });
+}
+</script>
+</body>
+</html>

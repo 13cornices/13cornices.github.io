@@ -1,0 +1,25 @@
+{
+  "name": "Soccer Sub Tracker",
+  "short_name": "SubTracker",
+  "description": "A mobile soccer substitution and playing-time tracker.",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#071120",
+  "theme_color": "#0d1f3c",
+  "icons": [
+    {
+      "src": "./icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "./icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}
