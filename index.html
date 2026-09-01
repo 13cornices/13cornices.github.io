@@ -323,6 +323,35 @@ function truncateLabel(label, maxLen) {
   return clean.length > maxLen ? clean.slice(0, Math.max(1, maxLen - 1)) + "…" : clean;
 }
 
+function cardCount(player, type) {
+  if (!player) return 0;
+  if (type === "yellow") return player.yellowCardsGame ?? player.yellowCards ?? 0;
+  return player.redCardsGame ?? player.redCards ?? 0;
+}
+
+function applyLiveStatus(planned, live, slot) {
+  const source = live || planned || {};
+  return {
+    ...planned,
+    totalMs: source.totalMs || 0,
+    benchMs: source.benchMs || 0,
+    gkMs: source.gkMs || 0,
+    h1Ms: source.h1Ms || 0,
+    h2Ms: 0,
+    yellowCardsGame: cardCount(source, "yellow"),
+    redCardsGame: cardCount(source, "red"),
+    redCardReason: source.redCardReason || "",
+    ejected: !!source.ejected,
+    dns: !!source.dns,
+    ...(slot !== undefined ? { slot } : {}),
+  };
+}
+
+function cardEventPlayerName(text) {
+  const match = String(text || "").match(/(?:YELLOW|RED) CARD:\s*(.+?)(?:\s+—\s+.*)?$/i);
+  return match ? match[1].trim() : null;
+}
+
 // ── Main App ──────────────────────────────────────────────────────────────────
 function App() {
   const initialSettingsRef = useRef(null);
@@ -420,6 +449,8 @@ function App() {
   const [planField, setPlanField] = useState(null);
   const [planBench, setPlanBench] = useState(null);
   const [planPos, setPlanPos] = useState(null);
+  const [secondHalfLineupMode, setSecondHalfLineupMode] = useState("planned");
+  const [halfTimeLineup, setHalfTimeLineup] = useState(null);
 
   // ── Timer ────────────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -431,7 +462,7 @@ function App() {
         lastRef.current = now;
         setGameMs(t => t + d);
         setField(fp => fp.map(p => ({ ...p, shiftMs: (p.shiftMs||0)+d, totalMs: (p.totalMs||0)+d, gkMs: (p.gkMs||0)+(p.isGK?d:0), h1Ms: (p.h1Ms||0)+(half===1?d:0), h2Ms: (p.h2Ms||0)+(half===2?d:0) })));
-        setBench(bp => bp.map(p => ({ ...p, benchMs: p.dns ? (p.benchMs||0) : (p.benchMs||0)+d })));
+        setBench(bp => bp.map(p => ({ ...p, benchMs: (p.dns || p.ejected) ? (p.benchMs||0) : (p.benchMs||0)+d })));
       }, 500);
     } else {
       clearInterval(timerRef.current);
@@ -582,8 +613,8 @@ function App() {
     else setH2Formation(savedWhich);
     // Use h1Formation if it exists, else use current field state (which IS h1 if called from h1 screen)
     const f1 = (which==="h1" ? savedWhich : h1Formation) || savedWhich;
-    setField(f1.field.map(p=>({...p, shiftMs:0, totalMs:0, benchMs:0, gkMs:0, h1Ms:0, h2Ms:0})));
-    setBench(f1.bench.map(p=>({...p, shiftMs:0, totalMs:0, benchMs:0, gkMs:0, h1Ms:0, h2Ms:0})));
+    setField(f1.field.map(p=>({...p, shiftMs:0, totalMs:0, benchMs:0, gkMs:0, h1Ms:0, h2Ms:0, yellowCardsGame:0, redCardsGame:0, redCardReason:"", ejected:false})));
+    setBench(f1.bench.map(p=>({...p, shiftMs:0, totalMs:0, benchMs:0, gkMs:0, h1Ms:0, h2Ms:0, yellowCardsGame:0, redCardsGame:0, redCardReason:"", ejected:false})));
     setPos(f1.pos);
     // Build initial events: kickoff + one DNS log per absent bench player
     const kickoffEvt = { time:"00:00", text:"▶ Kickoff — 1st half" };
@@ -591,7 +622,7 @@ function App() {
       .filter(p => p.dns)
       .map(p => ({ time:"00:00", text:`🚫 DNS: ${p.num?"#"+p.num+" ":""}${p.name} — did not show` }));
     setEvents([kickoffEvt, ...dnsEvts]);
-    setScore({us:0,them:0}); setGoals({}); setHalf(1);
+    setScore({us:0,them:0}); setGoals({}); setHalf(1); setHalfTimeLineup(null); setSecondHalfLineupMode("planned");
     if (!gameDate) setGameDate(new Date().toLocaleDateString());
     setRunning(true);
     setGameEnded(false);
@@ -825,10 +856,13 @@ function App() {
     const all = [...field, ...bench];
     const cardEvents = {};
     events.forEach(ev => {
-      const ym = ev.text.match(/YELLOW CARD: (.+)$/i);
-      const rm = ev.text.match(/RED CARD: (.+)$/i);
-      if (ym) { const k=ym[1].trim(); cardEvents[k] = cardEvents[k]||{y:0,r:0}; cardEvents[k].y++; }
-      if (rm) { const k=rm[1].trim(); cardEvents[k] = cardEvents[k]||{y:0,r:0}; cardEvents[k].r++; }
+      const isYellow = /YELLOW CARD:/i.test(ev.text);
+      const isRed = /RED CARD:/i.test(ev.text);
+      const k = cardEventPlayerName(ev.text);
+      if (!k) return;
+      cardEvents[k] = cardEvents[k]||{y:0,r:0};
+      if (isYellow) cardEvents[k].y++;
+      if (isRed) cardEvents[k].r++;
     });
     setPlayerStats(prev => {
       const next = { ...prev };
@@ -1058,51 +1092,78 @@ function App() {
     }
   }
 
+  function buildCurrentSecondHalfLineup(snapshot) {
+    const snap = snapshot || { field, bench, pos };
+    return {
+      field: (snap.field || []).map((p, slot) => ({ ...p, slot, shiftMs: 0, h2Ms: 0 })),
+      bench: (snap.bench || []).map(p => ({ ...p, shiftMs: 0, h2Ms: 0 })),
+      pos: { ...(snap.pos || {}) },
+    };
+  }
+
+  function buildPlannedSecondHalfLineup(snapshot) {
+    const snap = snapshot || { field, bench, pos };
+    const liveById = {};
+    [...(snap.field || []), ...(snap.bench || [])].forEach(p => { liveById[p.id] = p; });
+    const plannedBenchIds = new Set((h2Formation?.bench || []).map(p => p.id));
+    const addedBenchIds = new Set();
+    const nextField = [];
+    const nextBench = [];
+    const nextPos = {};
+
+    (h2Formation?.field || []).forEach((planned, oldSlot) => {
+      const merged = applyLiveStatus(planned, liveById[planned.id], nextField.length);
+      if (merged.ejected) {
+        if (!addedBenchIds.has(merged.id)) {
+          nextBench.push({ ...merged, isGK:false, shiftMs:0 });
+          addedBenchIds.add(merged.id);
+        }
+        return;
+      }
+      merged.dns = false;
+      nextPos[nextField.length] = (h2Formation.pos || {})[oldSlot] || (snap.pos || {})[oldSlot] || defaultPositions(teamSize, lineConfig)[nextField.length];
+      nextField.push(merged);
+    });
+
+    (h2Formation?.bench || []).forEach(planned => {
+      const merged = applyLiveStatus(planned, liveById[planned.id]);
+      if (addedBenchIds.has(merged.id)) return;
+      nextBench.push({ ...merged, shiftMs:0 });
+      addedBenchIds.add(merged.id);
+    });
+
+    Object.values(liveById).forEach(live => {
+      if (!live.ejected || plannedBenchIds.has(live.id) || addedBenchIds.has(live.id)) return;
+      nextBench.push({ ...live, isGK:false, shiftMs:0, h2Ms:0 });
+      addedBenchIds.add(live.id);
+    });
+
+    return { field: nextField, bench: nextBench, pos: nextPos };
+  }
+
+  function applySecondHalfLineup(mode, snapshot=halfTimeLineup) {
+    const lineup = mode === "planned" && h2Formation
+      ? buildPlannedSecondHalfLineup(snapshot)
+      : buildCurrentSecondHalfLineup(snapshot);
+    setField(lineup.field);
+    setBench(lineup.bench);
+    setPos(lineup.pos);
+    setSecondHalfLineupMode(mode);
+  }
+
   function doHalfTime() {
     setRunning(false);
     setGameMs(0);  // clock resets
     addEvt("⏸ Half time");
-    // Log DNS players still absent at half time
     bench.filter(p=>p.dns).forEach(p=>addEvt(`🚫 DNS at half time: ${p.num?"#"+p.num+" ":""}${p.name}`));
-    // Build a dns-status lookup from current bench (so DNS carries into h2)
-    const dnsByIdCurrentBench = {};
-    bench.forEach(p => { dnsByIdCurrentBench[p.id] = p.dns || false; });
-    // Load h2 formation if saved, preserving accumulated totalMs/gkMs/h1Ms for each player
-    if (h2Formation) {
-      // Merge: use h2 positions/assignments but carry forward timing from current state
-      const timingById = {};
-      [...field, ...bench].forEach(p => { timingById[p.id] = { totalMs: p.totalMs||0, gkMs: p.gkMs||0, h1Ms: p.h1Ms||0, dns: p.dns||false }; });
-      const mergedField = h2Formation.field.map(p => ({
-        ...p,
-        shiftMs: 0,
-        totalMs: timingById[p.id]?.totalMs || p.totalMs || 0,
-        gkMs:    timingById[p.id]?.gkMs    || p.gkMs    || 0,
-        h1Ms:    timingById[p.id]?.h1Ms    || p.h1Ms    || 0,
-        h2Ms: 0,
-        benchMs: 0,
-        dns: false, // field players in h2 are assumed present
-      }));
-      const mergedBench = h2Formation.bench.map(p => ({
-        ...p,
-        shiftMs: 0,
-        totalMs: timingById[p.id]?.totalMs || p.totalMs || 0,
-        gkMs:    timingById[p.id]?.gkMs    || p.gkMs    || 0,
-        h1Ms:    timingById[p.id]?.h1Ms    || p.h1Ms    || 0,
-        h2Ms: 0,
-        benchMs: 0,
-        // Carry DNS flag: use live bench status first, then h2Formation's stored flag
-        dns: timingById[p.id]?.dns ?? (p.dns || false),
-      }));
-      setField(mergedField);
-      setBench(mergedBench);
-      setPos(h2Formation.pos);
-    } else {
-      // No h2 formation saved — reset shifts, keep dns flags on bench
-      setField(fp => fp.map(p => ({ ...p, shiftMs: 0 })));
-      // Carry DNS flags into bench for h2
-      setBench(bp => bp.map(p => ({ ...p, shiftMs: 0, dns: dnsByIdCurrentBench[p.id] ?? p.dns ?? false })));
-    }
+    const snap = {
+      field: field.map(p=>({...p})),
+      bench: bench.map(p=>({...p})),
+      pos: {...pos},
+    };
+    setHalfTimeLineup(snap);
     setHalf(2);
+    applySecondHalfLineup(h2Formation ? "planned" : "current", snap);
   }
 
   function endGame() {
@@ -1153,10 +1214,18 @@ function App() {
 
   function giveCard(slot, type) {
     const p = field[slot];
+    if (!p) return;
     const label = (p.num ? "#"+p.num+" " : "") + p.name;
-    addEvt((type==="yellow" ? "🟨" : "🟥") + " " + type.toUpperCase() + " CARD: " + label);
-    if (type === "red") {
-      // Remove from field, add to bench as permanently ejected
+    if (type === "yellow") {
+      const nextYellow = cardCount(p, "yellow") + 1;
+      addEvt("🟨 YELLOW CARD: " + label);
+      if (nextYellow < 2) {
+        setField(fp => fp.map((player, i) => i===slot ? { ...player, yellowCardsGame: nextYellow } : player));
+        setCardSlot(null); setModal(null); setSelSlot(null);
+        return;
+      }
+      addEvt("🟥 RED CARD: " + label + " — double yellow");
+      const ejectedPlayer = { ...p, yellowCardsGame: nextYellow, redCardsGame: Math.max(1, cardCount(p, "red") + 1), redCardReason:"double yellow" };
       setField(fp => fp.filter((_, i) => i !== slot));
       setPos(ps => {
         const next = {};
@@ -1167,8 +1236,23 @@ function App() {
         });
         return next;
       });
-      setBench(bp => [...bp, { ...p, ejected: true, benchMs: p.benchMs || 0 }]);
-      addEvt("🚫 " + label + " ejected — down to " + (field.length - 1) + " players");
+      setBench(bp => [...bp, { ...ejectedPlayer, isGK:false, ejected: true, benchMs: ejectedPlayer.benchMs || 0 }]);
+      addEvt("🚫 " + label + " ejected — double yellow; down to " + (field.length - 1) + " players");
+    } else {
+      addEvt("🟥 RED CARD: " + label + " — direct red");
+      const ejectedPlayer = { ...p, redCardsGame: Math.max(1, cardCount(p, "red") + 1), redCardReason:"direct red" };
+      setField(fp => fp.filter((_, i) => i !== slot));
+      setPos(ps => {
+        const next = {};
+        Object.entries(ps).forEach(([k, v]) => {
+          const ki = parseInt(k);
+          if (ki < slot) next[ki] = v;
+          else if (ki > slot) next[ki - 1] = v;
+        });
+        return next;
+      });
+      setBench(bp => [...bp, { ...ejectedPlayer, isGK:false, ejected: true, benchMs: ejectedPlayer.benchMs || 0 }]);
+      addEvt("🚫 " + label + " ejected — direct red; down to " + (field.length - 1) + " players");
     }
     setCardSlot(null); setModal(null); setSelSlot(null);
   }
@@ -1635,6 +1719,19 @@ function App() {
         </div>
       </div>
 
+      {!running && half===2 && h2Formation && !gameEnded && (
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6,padding:"6px 10px",background:"#071120",borderBottom:"1px solid #1e3a5f",flexShrink:0}}>
+          <button onClick={()=>applySecondHalfLineup("current")}
+            style={{padding:"8px 6px",borderRadius:8,border:secondHalfLineupMode==="current"?"2px solid #60a5fa":"1px solid #1e3a5f",background:secondHalfLineupMode==="current"?"#1d4ed8":"#0d1f3c",color:secondHalfLineupMode==="current"?"#fff":"#7aa0cc",fontSize:11,fontWeight:800,cursor:"pointer"}}>
+            Current Field
+          </button>
+          <button onClick={()=>applySecondHalfLineup("planned")}
+            style={{padding:"8px 6px",borderRadius:8,border:secondHalfLineupMode==="planned"?"2px solid #4ade80":"1px solid #1e3a5f",background:secondHalfLineupMode==="planned"?"#15803d":"#0d1f3c",color:secondHalfLineupMode==="planned"?"#fff":"#7aa0cc",fontSize:11,fontWeight:800,cursor:"pointer"}}>
+            Planned 2H
+          </button>
+        </div>
+      )}
+
       {/* Field / Table toggle */}
       {gameView==="field" ? (
       <div style={{flex:1,display:"flex",justifyContent:"center",padding:"2px 4px 0",position:"relative",zIndex:0,minHeight:0,overflow:"hidden"}}>
@@ -1669,6 +1766,7 @@ function App() {
             const g  = goals[player.id] || 0;
             const dn = player.num || String(slot+1);
             const isSel = selSlot === slot;
+            const yellows = cardCount(player, "yellow");
             return (
               <g key={player.id} onPointerDown={e=>onCircleDown(e,slot)} style={{cursor:"grab",touchAction:"none"}}>
                 {/* Invisible hit area */}
@@ -1702,6 +1800,10 @@ function App() {
                 {g>0 && <>
                   <circle cx={p.x+23} cy={p.y-23} r={9} fill="#f59e0b"/>
                   <text x={p.x+23} y={p.y-23} textAnchor="middle" dominantBaseline="middle" fontSize="9" fill="#fff" fontWeight="700">{g}⚽</text>
+                </>}
+                {yellows>0 && <>
+                  <rect x={p.x-34} y={p.y-34} width="12" height="16" rx="2" fill="#facc15" stroke="#78350f" strokeWidth="1"/>
+                  {yellows>1 && <text x={p.x-28} y={p.y-23} textAnchor="middle" dominantBaseline="middle" fontSize="8" fill="#78350f" fontWeight="800">{yellows}</text>}
                 </>}
                 {/* Name below circle — with optional jersey # */}
                 <text x={p.x} y={p.y+44} textAnchor="middle" fontSize="11" fill="#e2e8f0" fontWeight="500">
@@ -3329,12 +3431,11 @@ function Summary({ field, bench, events, score, goals, gameMs, teamName, opponen
     // Collect card events per player name
     const cardMap = {};
     events.forEach(ev => {
-      const m = ev.text.match(/^(YELLOW|RED) CARD: (.+)$/i);
-      if (m) {
-        const key = m[2].trim();
-        if (!cardMap[key]) cardMap[key] = [];
-        cardMap[key].push(m[1].toUpperCase());
-      }
+      const key = cardEventPlayerName(ev.text);
+      if (!key) return;
+      if (!cardMap[key]) cardMap[key] = [];
+      if (/YELLOW CARD:/i.test(ev.text)) cardMap[key].push("YELLOW");
+      if (/RED CARD:/i.test(ev.text)) cardMap[key].push(/double yellow/i.test(ev.text) ? "RED (double yellow)" : "RED");
     });
 
     const allPlayers = [
