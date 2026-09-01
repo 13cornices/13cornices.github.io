@@ -3401,6 +3401,7 @@ function FormationPlanner({ which, field, bench, pos, goals, setField, setBench,
 function Summary({ field, bench, events, score, goals, gameMs, teamName, opponent, gameDate, teamSize, competition, statsSaved, onSaveStats, onBack }) {
   const [confirmSave, setConfirmSave] = useState(!statsSaved);
   const [exportedCsv, setExportedCsv] = useState(false);
+  const [exitPrompt, setExitPrompt] = useState(null); // "saveStats" | "exportCsv"
   const exportedCsvRef = useRef(false);
 
   function exportGameStats() {
@@ -3487,20 +3488,28 @@ function Summary({ field, bench, events, score, goals, gameMs, teamName, opponen
     setExportedCsv(true);
   }
 
-  function returnToSetup(saveStats=false) {
-    if (saveStats) onSaveStats();
-    if (!exportedCsvRef.current) {
-      const shouldExport = window.confirm("Export this game to CSV before returning to setup?");
-      if (shouldExport) exportGameStats();
-    }
+  function finishReturnToSetup() {
+    setExitPrompt(null);
     setConfirmSave(false);
     onBack();
   }
 
+  function continueReturnAfterStats(saveStats=false) {
+    if (saveStats) onSaveStats();
+    if (!exportedCsvRef.current) {
+      setExitPrompt("exportCsv");
+      return;
+    }
+    finishReturnToSetup();
+  }
+
+  function returnToSetup(saveStats=false) {
+    continueReturnAfterStats(saveStats);
+  }
+
   function requestMenuReturn() {
     if (confirmSave && !statsSaved) {
-      const saveStats = window.confirm("Save this game's player stats before returning to setup?");
-      returnToSetup(saveStats);
+      setExitPrompt("saveStats");
       return;
     }
     returnToSetup(false);
@@ -3610,6 +3619,33 @@ function Summary({ field, bench, events, score, goals, gameMs, teamName, opponen
         </div>
       ) : (
         <button onClick={()=>returnToSetup(false)} style={{width:"100%",padding:"13px",borderRadius:12,background:"#1d4ed8",border:"none",color:"#fff",fontWeight:700,fontSize:15,cursor:"pointer"}}>🏁 End Game &amp; Return to Setup</button>
+      )}
+
+      {exitPrompt && (
+        <div style={S.overlay} onClick={()=>setExitPrompt(null)}>
+          <div style={{...S.card,maxWidth:360}} onClick={e=>e.stopPropagation()}>
+            <div style={{fontSize:15,color:"#fff",fontWeight:800,marginBottom:8}}>Sub Tracker says</div>
+            <div style={{fontSize:13,color:"#cbd5e1",lineHeight:1.35,marginBottom:14}}>
+              {exitPrompt==="saveStats"
+                ? "Save this game's player stats before returning to setup?"
+                : "Export this game to CSV before returning to setup?"}
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+              <button onClick={()=>{
+                if (exitPrompt==="saveStats") continueReturnAfterStats(false);
+                else finishReturnToSetup();
+              }} style={{padding:"11px",borderRadius:10,border:"1px solid #1e3a5f",background:"#071120",color:"#93c5fd",fontWeight:800,fontSize:14,cursor:"pointer"}}>
+                No
+              </button>
+              <button onClick={()=>{
+                if (exitPrompt==="saveStats") continueReturnAfterStats(true);
+                else { exportGameStats(); finishReturnToSetup(); }
+              }} style={{padding:"11px",borderRadius:10,border:"none",background:"#15803d",color:"#fff",fontWeight:800,fontSize:14,cursor:"pointer"}}>
+                Yes
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );
